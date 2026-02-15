@@ -74,6 +74,7 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun AppTwoScreen() {
     var resultText by remember { mutableStateOf<String?>(null) }
+    var elapsedText by remember { mutableStateOf<String?>(null) }
     var isError by remember { mutableStateOf(false) }
     var loading by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
@@ -89,15 +90,20 @@ fun AppTwoScreen() {
                 onClick = {
                     loading = true
                     resultText = null
+                    elapsedText = null
                     scope.launch {
                         try {
-                            val code = withContext(Dispatchers.IO) {
+                            val (code, elapsedMs) = withContext(Dispatchers.IO) {
                                 val client = createOkHttpClientForSelfSignedServer()
                                 val request = Request.Builder().url(REQUEST_URL).build()
-                                client.newCall(request).execute().code
+                                val start = System.nanoTime()
+                                val response = client.newCall(request).execute()
+                                val elapsed = (System.nanoTime() - start) / 1_000_000
+                                Pair(response.code, elapsed)
                             }
                             withContext(Dispatchers.Main.immediate) {
                                 resultText = "Код ответа: $code"
+                                elapsedText = "Время: ${elapsedMs} мс"
                                 isError = false
                             }
                         } catch (e: Exception) {
@@ -121,6 +127,13 @@ fun AppTwoScreen() {
                     text = text,
                     style = MaterialTheme.typography.titleMedium,
                     color = if (isError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface
+                )
+            }
+            elapsedText?.let { text ->
+                Text(
+                    text = text,
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
         }

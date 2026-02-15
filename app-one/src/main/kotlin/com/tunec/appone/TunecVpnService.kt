@@ -15,9 +15,9 @@ import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import androidx.core.app.NotificationCompat
-import com.tunec.appone.relay.RelayExecutor
 import com.tunec.appone.relay.RelayRequest
 import com.tunec.appone.relay.RelayResponse
+import com.tunec.appone.relay.WebSocketRelayClient
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.net.Inet4Address
@@ -36,12 +36,15 @@ private const val CHANNEL_ID = "tunec_vpn"
 private const val NOTIFICATION_ID = 1
 /** Max TCP payload per segment to stay under typical MTU (1500) = 1500 - 20 IP - 20 TCP */
 private const val MAX_TCP_PAYLOAD = 1460
+/** WebSocket URL of the AppBack relay server. */
+private const val APP_BACK_URL = "ws://192.168.1.93:3000"
 
 enum class VpnStatus { DISCONNECTED, CONNECTING, CONNECTED, ERROR }
 
 class TunecVpnService : VpnService() {
 
     companion object {
+        const val ACTION_DISCONNECT = "com.tunec.appone.DISCONNECT_VPN"
         private val _vpnState = MutableStateFlow(VpnStatus.DISCONNECTED)
         val vpnState: StateFlow<VpnStatus> = _vpnState.asStateFlow()
     }
@@ -55,7 +58,7 @@ class TunecVpnService : VpnService() {
     private var underlyingNetwork: Network? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var ipId = 0
-    private var relayExecutor: RelayExecutor? = null
+    private var relayClient: WebSocketRelayClient? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -63,6 +66,10 @@ class TunecVpnService : VpnService() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_DISCONNECT) {
+            disconnect()
+            return START_NOT_STICKY
+        }
         if (tunInterface != null) return START_STICKY
         _vpnState.value = VpnStatus.CONNECTING
         val iface = establishVpn()
@@ -75,15 +82,9 @@ class TunecVpnService : VpnService() {
         tunInterface = iface
         tunOutput = FileOutputStream(iface.fileDescriptor)
         requestUnderlyingNetwork()
-        relayExecutor = RelayExecutor(
+        relayClient = WebSocketRelayClient(
+            serverUrl = APP_BACK_URL,
             protectSocket = { socket -> protect(socket) },
-            bindSocket = { socket ->
-                underlyingNetwork?.let { net ->
-                    try { net.bindSocket(socket) } catch (e: Exception) {
-                        Log.w(TAG, "bindSocket failed", e)
-                    }
-                }
-            },
             onResponse = { serialized -> handleRelayResponse(serialized) }
         )
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
@@ -97,23 +98,31 @@ class TunecVpnService : VpnService() {
         return START_STICKY
     }
 
-    override fun onDestroy() {
+    private fun disconnect() {
+        if (!running && tunInterface == null) return   // already stopped
+        Log.i(TAG, "Disconnecting VPN")
         _vpnState.value = VpnStatus.DISCONNECTED
         running = false
+        // Close TUN first so the blocking read() in runRelay exits immediately
+        tunOutput = null
+        try { tunInterface?.close() } catch (_: Exception) {}
+        tunInterface = null
         relayThread?.interrupt()
         relayThread = null
-        relayExecutor?.shutdown()
-        relayExecutor = null
+        relayClient?.shutdown()
+        relayClient = null
         connections.clear()
         networkCallback?.let { cb ->
             try { (getSystemService(CONNECTIVITY_SERVICE) as? ConnectivityManager)?.unregisterNetworkCallback(cb) } catch (_: Exception) {}
         }
         networkCallback = null
         underlyingNetwork = null
-        tunOutput = null
-        try { tunInterface?.close() } catch (_: Exception) {}
-        tunInterface = null
         stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
+    override fun onDestroy() {
+        disconnect()
         super.onDestroy()
     }
 
@@ -222,7 +231,7 @@ class TunecVpnService : VpnService() {
             Log.i(TAG, "OUT  SYN  → ${formatIp(dstIp)}:$dstPort")
             try {
                 val request = RelayRequest.Connect(key, formatIp(dstIp), dstPort)
-                val respBytes = relayExecutor?.handleRequest(request.serialize())
+                val respBytes = relayClient?.handleRequest(request.serialize())
                 if (respBytes == null) {
                     Log.e(TAG, "No executor or no response for Connect")
                     return
@@ -253,7 +262,7 @@ class TunecVpnService : VpnService() {
             buf.position(payloadOff); buf.get(payload)
             Log.i(TAG, "OUT  DATA → ${formatIp(dstIp)}:$dstPort len=$payloadLen")
             val request = RelayRequest.Data(key, payload)
-            relayExecutor?.handleRequest(request.serialize())
+            relayClient?.handleRequest(request.serialize())
             // ACK to the app so it doesn't retransmit (prevents duplicate data → BAD_RECORD_MAC)
             writeAckOnly(state, output)
         }

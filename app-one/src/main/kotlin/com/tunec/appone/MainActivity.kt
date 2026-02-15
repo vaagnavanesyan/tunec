@@ -66,7 +66,9 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun stopVpnService() {
-        stopService(Intent(this, TunecVpnService::class.java))
+        startService(Intent(this, TunecVpnService::class.java).apply {
+            action = TunecVpnService.ACTION_DISCONNECT
+        })
     }
 }
 
