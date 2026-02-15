@@ -34,7 +34,7 @@ import javax.net.ssl.SSLContext
 import javax.net.ssl.TrustManager
 import javax.net.ssl.X509TrustManager
 
-private const val REQUEST_URL = "https://192.168.1.101:8080/index.html"
+private const val REQUEST_URL = "http://192.168.1.101:8080"
 
 /**
  * Создаёт OkHttpClient, доверяющий самоподписанным сертификатам.
