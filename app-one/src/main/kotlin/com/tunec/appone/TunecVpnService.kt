@@ -27,6 +27,9 @@ import java.nio.ByteOrder
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.concurrent.thread
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 private const val TAG = "TunecVpn"
 private const val CHANNEL_ID = "tunec_vpn"
@@ -34,7 +37,14 @@ private const val NOTIFICATION_ID = 1
 /** Max TCP payload per segment to stay under typical MTU (1500) = 1500 - 20 IP - 20 TCP */
 private const val MAX_TCP_PAYLOAD = 1460
 
+enum class VpnStatus { DISCONNECTED, CONNECTING, CONNECTED, ERROR }
+
 class TunecVpnService : VpnService() {
+
+    companion object {
+        private val _vpnState = MutableStateFlow(VpnStatus.DISCONNECTED)
+        val vpnState: StateFlow<VpnStatus> = _vpnState.asStateFlow()
+    }
 
     private var tunInterface: ParcelFileDescriptor? = null
     private var tunOutput: FileOutputStream? = null
@@ -54,9 +64,11 @@ class TunecVpnService : VpnService() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (tunInterface != null) return START_STICKY
+        _vpnState.value = VpnStatus.CONNECTING
         val iface = establishVpn()
         if (iface == null) {
             Log.e(TAG, "Failed to establish VPN")
+            _vpnState.value = VpnStatus.ERROR
             stopSelf()
             return START_NOT_STICKY
         }
@@ -81,10 +93,12 @@ class TunecVpnService : VpnService() {
         }
         running = true
         relayThread = thread(name = "TunecRelay") { runRelay(iface) }
+        _vpnState.value = VpnStatus.CONNECTED
         return START_STICKY
     }
 
     override fun onDestroy() {
+        _vpnState.value = VpnStatus.DISCONNECTED
         running = false
         relayThread?.interrupt()
         relayThread = null
@@ -111,7 +125,6 @@ class TunecVpnService : VpnService() {
                 .addAddress("10.0.0.2", 24)
                 .addRoute("0.0.0.0", 0)
                 .addAllowedApplication("com.tunec.apptwo")
-                .addAllowedApplication("com.android.chrome")
                 .setSession("Tunec VPN")
                 .establish()
         } catch (e: Exception) {

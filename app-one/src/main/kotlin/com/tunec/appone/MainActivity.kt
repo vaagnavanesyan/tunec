@@ -12,15 +12,20 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import com.tunec.appone.ui.theme.AppOneTheme
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 
 class MainActivity : ComponentActivity() {
 
@@ -37,7 +42,11 @@ class MainActivity : ComponentActivity() {
         setContent {
             AppOneTheme {
                 Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-                    AppOneScreen(onConnectVpn = { tryConnectVpn() })
+                    AppOneScreen(
+                        vpnState = TunecVpnService.vpnState,
+                        onConnectVpn = { tryConnectVpn() },
+                        onDisconnectVpn = { stopVpnService() }
+                    )
                 }
             }
         }
@@ -55,10 +64,20 @@ class MainActivity : ComponentActivity() {
     private fun startVpnService() {
         startService(Intent(this, TunecVpnService::class.java))
     }
+
+    private fun stopVpnService() {
+        stopService(Intent(this, TunecVpnService::class.java))
+    }
 }
 
 @Composable
-fun AppOneScreen(onConnectVpn: () -> Unit = {}) {
+fun AppOneScreen(
+    vpnState: StateFlow<VpnStatus> = MutableStateFlow(VpnStatus.DISCONNECTED),
+    onConnectVpn: () -> Unit = {},
+    onDisconnectVpn: () -> Unit = {}
+) {
+    val status by vpnState.collectAsState()
+
     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
@@ -66,9 +85,44 @@ fun AppOneScreen(onConnectVpn: () -> Unit = {}) {
             modifier = Modifier.padding(24.dp)
         ) {
             Text("App One", style = MaterialTheme.typography.headlineMedium)
-            Button(onClick = onConnectVpn) {
-                Text("Connect to VPN")
+
+            when (status) {
+                VpnStatus.DISCONNECTED, VpnStatus.ERROR -> {
+                    Button(onClick = onConnectVpn) {
+                        Text("Connect to VPN")
+                    }
+                }
+                VpnStatus.CONNECTING -> {
+                    Button(onClick = {}, enabled = false) {
+                        Text("Connecting...")
+                    }
+                }
+                VpnStatus.CONNECTED -> {
+                    Button(
+                        onClick = onDisconnectVpn,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = MaterialTheme.colorScheme.error
+                        )
+                    ) {
+                        Text("Disconnect VPN")
+                    }
+                }
             }
+
+            Text(
+                text = when (status) {
+                    VpnStatus.DISCONNECTED -> "Disconnected"
+                    VpnStatus.CONNECTING -> "Connecting..."
+                    VpnStatus.CONNECTED -> "Connected"
+                    VpnStatus.ERROR -> "Connection error"
+                },
+                style = MaterialTheme.typography.titleMedium,
+                color = when (status) {
+                    VpnStatus.CONNECTED -> MaterialTheme.colorScheme.primary
+                    VpnStatus.ERROR -> MaterialTheme.colorScheme.error
+                    else -> MaterialTheme.colorScheme.onSurfaceVariant
+                }
+            )
         }
     }
 }
