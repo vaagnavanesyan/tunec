@@ -15,13 +15,15 @@ import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import com.tunec.appone.relay.RelayExecutor
+import com.tunec.appone.relay.RelayRequest
+import com.tunec.appone.relay.RelayResponse
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.net.Inet4Address
 import java.net.InetAddress
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.net.Socket
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.concurrent.thread
@@ -35,6 +37,7 @@ private const val MAX_TCP_PAYLOAD = 1460
 class TunecVpnService : VpnService() {
 
     private var tunInterface: ParcelFileDescriptor? = null
+    private var tunOutput: FileOutputStream? = null
     private var relayThread: Thread? = null
     private var running = false
     private val connections = ConcurrentHashMap<String, ConnectionState>()
@@ -42,6 +45,7 @@ class TunecVpnService : VpnService() {
     private var underlyingNetwork: Network? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var ipId = 0
+    private var relayExecutor: RelayExecutor? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -57,7 +61,19 @@ class TunecVpnService : VpnService() {
             return START_NOT_STICKY
         }
         tunInterface = iface
+        tunOutput = FileOutputStream(iface.fileDescriptor)
         requestUnderlyingNetwork()
+        relayExecutor = RelayExecutor(
+            protectSocket = { socket -> protect(socket) },
+            bindSocket = { socket ->
+                underlyingNetwork?.let { net ->
+                    try { net.bindSocket(socket) } catch (e: Exception) {
+                        Log.w(TAG, "bindSocket failed", e)
+                    }
+                }
+            },
+            onResponse = { serialized -> handleRelayResponse(serialized) }
+        )
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             startForeground(NOTIFICATION_ID, createNotification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
         } else {
@@ -72,13 +88,15 @@ class TunecVpnService : VpnService() {
         running = false
         relayThread?.interrupt()
         relayThread = null
-        connections.values.forEach { try { it.socket.close() } catch (_: Exception) {} }
+        relayExecutor?.shutdown()
+        relayExecutor = null
         connections.clear()
         networkCallback?.let { cb ->
             try { (getSystemService(CONNECTIVITY_SERVICE) as? ConnectivityManager)?.unregisterNetworkCallback(cb) } catch (_: Exception) {}
         }
         networkCallback = null
         underlyingNetwork = null
+        tunOutput = null
         try { tunInterface?.close() } catch (_: Exception) {}
         tunInterface = null
         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -144,7 +162,7 @@ class TunecVpnService : VpnService() {
     private fun runRelay(iface: ParcelFileDescriptor) {
         val fd = iface.fileDescriptor
         val input = FileInputStream(fd)
-        val output = FileOutputStream(fd)
+        val output = tunOutput ?: return
         val raw = ByteArray(32767)
         val buf = ByteBuffer.wrap(raw).order(ByteOrder.BIG_ENDIAN)
         Log.i(TAG, "Relay started")
@@ -177,7 +195,7 @@ class TunecVpnService : VpnService() {
         val dstPort = buf.getShort(ihl + 2).toInt() and 0xFFFF
         val seq = buf.getInt(ihl + 4)
         val dataOff = ((buf.get(ihl + 12).toInt() and 0xFF) shr 4) * 4
-        val flags = buf.get(ihl + 13).toInt() and 0xFF   // TCP flags byte is at offset 13
+        val flags = buf.get(ihl + 13).toInt() and 0xFF
         val syn = flags and 0x02 != 0
         val ack = flags and 0x10 != 0
         val payloadOff = ihl + dataOff
@@ -186,12 +204,24 @@ class TunecVpnService : VpnService() {
         val dstAddr = InetAddress.getByAddress(dstIp) as? Inet4Address ?: return
         val key = "${formatIp(srcIp)}:$srcPort-${formatIp(dstIp)}:$dstPort"
 
-        // SYN → open real connection + send SYN-ACK to tun
+        // SYN → serialize Connect → executor opens real connection → SYN-ACK to tun
         if (syn && !ack) {
             Log.i(TAG, "OUT  SYN  → ${formatIp(dstIp)}:$dstPort")
             try {
-                val state = getOrCreateConnection(key, srcPort, dstAddr, dstPort)
-                state.appSeq.set((seq + 1).toLong())          // SYN consumes 1 seq
+                val request = RelayRequest.Connect(key, formatIp(dstIp), dstPort)
+                val respBytes = relayExecutor?.handleRequest(request.serialize())
+                if (respBytes == null) {
+                    Log.e(TAG, "No executor or no response for Connect")
+                    return
+                }
+                val resp = RelayResponse.deserialize(respBytes)
+                if (resp is RelayResponse.Error) {
+                    Log.e(TAG, "Connect error: ${resp.message}")
+                    return
+                }
+                val state = ConnectionState(srcPort, dstAddr, dstPort)
+                connections[key] = state
+                state.appSeq.set((seq + 1).toLong())
                 writeSynAck(state, seq, output)
             } catch (e: Exception) {
                 Log.e(TAG, "SYN handling error", e)
@@ -204,78 +234,44 @@ class TunecVpnService : VpnService() {
         // Update expected app seq
         if (payloadLen > 0) state.appSeq.set((seq.toLong() and 0xFFFFFFFFL) + payloadLen)
 
-        // Forward payload
+        // Forward payload via executor
         if (payloadLen > 0) {
             val payload = ByteArray(payloadLen)
             buf.position(payloadOff); buf.get(payload)
             Log.i(TAG, "OUT  DATA → ${formatIp(dstIp)}:$dstPort len=$payloadLen")
-            try {
-                state.socket.getOutputStream().write(payload)
-                state.socket.getOutputStream().flush()
-            } catch (e: Exception) {
-                Log.e(TAG, "Forward write error", e)
-                connections.remove(key); state.socket.close()
-                return
-            }
+            val request = RelayRequest.Data(key, payload)
+            relayExecutor?.handleRequest(request.serialize())
             // ACK to the app so it doesn't retransmit (prevents duplicate data → BAD_RECORD_MAC)
             writeAckOnly(state, output)
         }
-
-        // Start response reader once
-        if (state.readerStarted.compareAndSet(0, 1)) {
-            Log.i(TAG, "Starting response reader for $key")
-            startResponseReader(key, state, output)
-        }
     }
 
-    // ── Connection management ──────────────────────────────────────────────
+    // ── Relay response handler (called from executor reader threads) ───────
 
-    private fun getOrCreateConnection(key: String, clientPort: Int, addr: Inet4Address, port: Int): ConnectionState {
-        return connections.getOrPut(key) {
-            // Use plain java.net.Socket — bind to an ephemeral port first so it gets an fd,
-            // then protect() can work before connect().
-            val socket = Socket()
-            socket.bind(null)  // allocates fd
-            if (!protect(socket)) {
-                Log.e(TAG, "protect() failed"); socket.close()
-                throw IllegalStateException("protect failed")
-            }
-            underlyingNetwork?.let { net ->
-                try { net.bindSocket(socket) } catch (e: Exception) {
-                    Log.w(TAG, "bindSocket failed", e)
+    private fun handleRelayResponse(serialized: ByteArray) {
+        val response = RelayResponse.deserialize(serialized)
+        val out = tunOutput ?: return
+        when (response) {
+            is RelayResponse.Connected -> { /* handled synchronously in processPacket */ }
+            is RelayResponse.Data -> {
+                val state = connections[response.connectionId] ?: return
+                Log.i(TAG, "IN   DATA ← ${state.serverAddr.hostAddress}:${state.serverPort} len=${response.payload.size}")
+                // Send in MTU-sized segments so TLS and IP don't hit fragmentation issues
+                var off = 0
+                while (off < response.payload.size) {
+                    val chunk = (response.payload.size - off).coerceAtMost(MAX_TCP_PAYLOAD)
+                    val pkt = buildResponsePacket(state, response.payload, off, chunk)
+                    synchronized(out) { out.write(pkt); out.flush() }
+                    off += chunk
                 }
             }
-            socket.connect(java.net.InetSocketAddress(addr, port), 10000)
-            socket.soTimeout = 0  // no timeout on reads — reader blocks until data arrives
-            socket.tcpNoDelay = true
-            Log.i(TAG, "Connected to ${addr.hostAddress}:$port")
-            ConnectionState(clientPort, addr, port, socket)
-        }
-    }
-
-    private fun startResponseReader(key: String, state: ConnectionState, tunOut: FileOutputStream) {
-        thread(name = "Reader-$key") {
-            try {
-                val inp = state.socket.getInputStream()
-                val buf = ByteArray(16384)
-                while (running && !state.socket.isClosed) {
-                    val n = inp.read(buf)
-                    if (n <= 0) break
-                    Log.i(TAG, "IN   DATA ← ${state.serverAddr.hostAddress}:${state.serverPort} len=$n")
-                    // Send in MTU-sized segments so TLS and IP don't hit fragmentation issues
-                    var off = 0
-                    while (off < n) {
-                        val chunk = (n - off).coerceAtMost(MAX_TCP_PAYLOAD)
-                        val pkt = buildResponsePacket(state, buf, off, chunk)
-                        synchronized(tunOut) { tunOut.write(pkt); tunOut.flush() }
-                        off += chunk
-                    }
-                }
-            } catch (e: Exception) {
-                if (running) Log.e(TAG, "Reader error ($key)", e)
-            } finally {
-                connections.remove(key)
-                try { state.socket.close() } catch (_: Exception) {}
+            is RelayResponse.Disconnected -> {
+                connections.remove(response.connectionId)
+                Log.i(TAG, "Connection closed: ${response.connectionId}")
+            }
+            is RelayResponse.Error -> {
+                connections.remove(response.connectionId)
+                Log.e(TAG, "Relay error ${response.connectionId}: ${response.message}")
             }
         }
     }
@@ -395,14 +391,13 @@ class TunecVpnService : VpnService() {
     private fun formatIp(ip: ByteArray) =
         "${ip[0].toInt() and 0xFF}.${ip[1].toInt() and 0xFF}.${ip[2].toInt() and 0xFF}.${ip[3].toInt() and 0xFF}"
 
+    /** TCP connection state — tracks seq/ack numbers and port info for packet construction. */
     private class ConnectionState(
         val clientPort: Int,
         val serverAddr: Inet4Address,
-        val serverPort: Int,
-        val socket: java.net.Socket
+        val serverPort: Int
     ) {
         val appSeq = AtomicLong(0)
         val ourSeq = AtomicLong(2)  // SYN-ACK ISN=1 consumes 1 seq, so first data byte = 2
-        val readerStarted = AtomicLong(0)
     }
 }
