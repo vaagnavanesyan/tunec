@@ -29,6 +29,8 @@ import kotlin.concurrent.thread
 private const val TAG = "TunecVpn"
 private const val CHANNEL_ID = "tunec_vpn"
 private const val NOTIFICATION_ID = 1
+/** Max TCP payload per segment to stay under typical MTU (1500) = 1500 - 20 IP - 20 TCP */
+private const val MAX_TCP_PAYLOAD = 1460
 
 class TunecVpnService : VpnService() {
 
@@ -91,6 +93,7 @@ class TunecVpnService : VpnService() {
                 .addAddress("10.0.0.2", 24)
                 .addRoute("0.0.0.0", 0)
                 .addAllowedApplication("com.tunec.apptwo")
+                .addAllowedApplication("com.android.chrome")
                 .setSession("Tunec VPN")
                 .establish()
         } catch (e: Exception) {
@@ -205,8 +208,7 @@ class TunecVpnService : VpnService() {
         if (payloadLen > 0) {
             val payload = ByteArray(payloadLen)
             buf.position(payloadOff); buf.get(payload)
-            val body = String(payload, Charsets.UTF_8)
-            Log.i(TAG, "OUT  DATA → ${formatIp(dstIp)}:$dstPort len=$payloadLen\n$body")
+            Log.i(TAG, "OUT  DATA → ${formatIp(dstIp)}:$dstPort len=$payloadLen")
             try {
                 state.socket.getOutputStream().write(payload)
                 state.socket.getOutputStream().flush()
@@ -215,6 +217,8 @@ class TunecVpnService : VpnService() {
                 connections.remove(key); state.socket.close()
                 return
             }
+            // ACK to the app so it doesn't retransmit (prevents duplicate data → BAD_RECORD_MAC)
+            writeAckOnly(state, output)
         }
 
         // Start response reader once
@@ -257,10 +261,15 @@ class TunecVpnService : VpnService() {
                 while (running && !state.socket.isClosed) {
                     val n = inp.read(buf)
                     if (n <= 0) break
-                    val body = String(buf, 0, n, Charsets.UTF_8)
-                    Log.i(TAG, "IN   DATA ← ${state.serverAddr.hostAddress}:${state.serverPort} len=$n\n$body")
-                    val pkt = buildResponsePacket(state, buf, n)
-                    synchronized(tunOut) { tunOut.write(pkt); tunOut.flush() }
+                    Log.i(TAG, "IN   DATA ← ${state.serverAddr.hostAddress}:${state.serverPort} len=$n")
+                    // Send in MTU-sized segments so TLS and IP don't hit fragmentation issues
+                    var off = 0
+                    while (off < n) {
+                        val chunk = (n - off).coerceAtMost(MAX_TCP_PAYLOAD)
+                        val pkt = buildResponsePacket(state, buf, off, chunk)
+                        synchronized(tunOut) { tunOut.write(pkt); tunOut.flush() }
+                        off += chunk
+                    }
                 }
             } catch (e: Exception) {
                 if (running) Log.e(TAG, "Reader error ($key)", e)
@@ -291,7 +300,25 @@ class TunecVpnService : VpnService() {
         synchronized(out) { out.write(pkt); out.flush() }
     }
 
-    private fun buildResponsePacket(state: ConnectionState, payload: ByteArray, payloadLen: Int): ByteArray {
+    /** Send ACK-only segment to the app so it doesn't retransmit (avoids duplicate TLS data). */
+    private fun writeAckOnly(state: ConnectionState, out: FileOutputStream) {
+        val pkt = ByteArray(40)
+        val b = ByteBuffer.wrap(pkt).order(ByteOrder.BIG_ENDIAN)
+        writeIpHeader(b, 40, state.serverAddr.address, tunnelAddress)
+        b.putShort((state.serverPort and 0xFFFF).toShort())
+        b.putShort((state.clientPort and 0xFFFF).toShort())
+        b.putInt(state.ourSeq.get().toInt())                 // our seq (no new data)
+        b.putInt(state.appSeq.get().toInt())                 // ack = next expected from app
+        b.put(0x50.toByte())                                 // data offset = 5
+        b.put(0x10.toByte())                                 // flags = ACK only
+        b.putShort(65535.toShort())                           // window
+        b.putShort(0)
+        b.putShort(0)
+        computeChecksums(pkt, 20, 20, 0)
+        synchronized(out) { out.write(pkt); out.flush() }
+    }
+
+    private fun buildResponsePacket(state: ConnectionState, payload: ByteArray, offset: Int, payloadLen: Int): ByteArray {
         val totalLen = 40 + payloadLen
         val pkt = ByteArray(totalLen)
         val b = ByteBuffer.wrap(pkt).order(ByteOrder.BIG_ENDIAN)
@@ -306,7 +333,7 @@ class TunecVpnService : VpnService() {
         b.putShort(65535.toShort())                           // window
         b.putShort(0)                                         // checksum
         b.putShort(0)                                         // urgent ptr
-        b.put(payload, 0, payloadLen)
+        b.put(payload, offset, payloadLen)
         state.ourSeq.addAndGet(payloadLen.toLong())
         computeChecksums(pkt, 20, 20, payloadLen)
         return pkt

@@ -28,9 +28,35 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import java.security.cert.X509Certificate
 import java.util.concurrent.TimeUnit
+import javax.net.ssl.SSLContext
+import javax.net.ssl.TrustManager
+import javax.net.ssl.X509TrustManager
 
-private const val REQUEST_URL = "http://192.168.1.101:8080/index.html"
+private const val REQUEST_URL = "https://192.168.1.101:8080/index.html"
+
+/**
+ * Создаёт OkHttpClient, доверяющий самоподписанным сертификатам.
+ * Использовать только для разработки/внутренних серверов.
+ */
+private fun createOkHttpClientForSelfSignedServer(): OkHttpClient {
+    val trustAllCerts = arrayOf<TrustManager>(
+        object : X509TrustManager {
+            override fun checkClientTrusted(chain: Array<out X509Certificate>, authType: String) {}
+            override fun checkServerTrusted(chain: Array<out X509Certificate>, authType: String) {}
+            override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
+        }
+    )
+    val sslContext = SSLContext.getInstance("TLS")
+    sslContext.init(null, trustAllCerts, java.security.SecureRandom())
+    return OkHttpClient.Builder()
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(10, TimeUnit.SECONDS)
+        .sslSocketFactory(sslContext.socketFactory, trustAllCerts[0] as X509TrustManager)
+        .hostnameVerifier { _, _ -> true }
+        .build()
+}
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -66,10 +92,7 @@ fun AppTwoScreen() {
                     scope.launch {
                         try {
                             val code = withContext(Dispatchers.IO) {
-                                val client = OkHttpClient.Builder()
-                                    .connectTimeout(10, TimeUnit.SECONDS)
-                                    .readTimeout(10, TimeUnit.SECONDS)
-                                    .build()
+                                val client = createOkHttpClientForSelfSignedServer()
                                 val request = Request.Builder().url(REQUEST_URL).build()
                                 client.newCall(request).execute().code
                             }
