@@ -19,7 +19,16 @@ export interface DisconnectRequest {
   connectionId: string;
 }
 
-export type RelayRequest = ConnectRequest | DataRequest | DisconnectRequest;
+export interface ShutdownWriteRequest {
+  type: "shutdown_write";
+  connectionId: string;
+}
+
+export type RelayRequest =
+  | ConnectRequest
+  | DataRequest
+  | DisconnectRequest
+  | ShutdownWriteRequest;
 
 // ── Response: AppBack → AppOne ──────────────────────────────────────────────
 

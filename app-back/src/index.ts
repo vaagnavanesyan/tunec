@@ -32,7 +32,7 @@ wss.on("connection", (ws: WebSocket) => {
     try {
       const text = typeof raw === "string" ? raw : raw.toString("utf-8");
       const request: RelayRequest = JSON.parse(text);
-      console.log(`[${TAG}] ← ${request.type} ${request.connectionId}`);
+      //  console.log(`[${TAG}] ← ${request.type} ${request.connectionId}`);
       relay.handleRequest(request);
     } catch (err) {
       console.error(`[${TAG}] Invalid message:`, err);

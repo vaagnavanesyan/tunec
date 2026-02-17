@@ -12,12 +12,15 @@ import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.tunec.appone.relay.RelayRequest
 import com.tunec.appone.relay.RelayResponse
 import com.tunec.appone.relay.WebSocketRelayClient
+import java.io.ByteArrayOutputStream
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.net.Inet4Address
@@ -38,6 +41,10 @@ private const val NOTIFICATION_ID = 1
 private const val MAX_TCP_PAYLOAD = 1460
 /** WebSocket URL of the AppBack relay server. */
 private const val APP_BACK_URL = "ws://192.168.1.93:3000"
+/** Outbound batch: flush when buffer reaches this size (bytes). */
+private const val BATCH_SIZE_THRESHOLD = 4096
+/** Outbound batch: max delay before flush (ms). */
+private const val BATCH_FLUSH_DELAY_MS = 5L
 
 enum class VpnStatus { DISCONNECTED, CONNECTING, CONNECTED, ERROR }
 
@@ -59,6 +66,8 @@ class TunecVpnService : VpnService() {
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var ipId = 0
     private var relayClient: WebSocketRelayClient? = null
+    private val outboundBatches = ConcurrentHashMap<String, OutboundBatch>()
+    private val batchHandler = Handler(Looper.getMainLooper())
 
     override fun onCreate() {
         super.onCreate()
@@ -111,6 +120,10 @@ class TunecVpnService : VpnService() {
         relayThread = null
         relayClient?.shutdown()
         relayClient = null
+        outboundBatches.values.forEach { batch ->
+            batch.getPendingFlush()?.let { batchHandler.removeCallbacks(it) }
+        }
+        outboundBatches.clear()
         connections.clear()
         networkCallback?.let { cb ->
             try { (getSystemService(CONNECTIVITY_SERVICE) as? ConnectivityManager)?.unregisterNetworkCallback(cb) } catch (_: Exception) {}
@@ -134,6 +147,7 @@ class TunecVpnService : VpnService() {
                 .addAddress("10.0.0.2", 24)
                 .addRoute("0.0.0.0", 0)
                 .addAllowedApplication("com.tunec.apptwo")
+                .addAllowedApplication("com.sec.android.app.sbrowser")
                 .setSession("Tunec VPN")
                 .establish()
         } catch (e: Exception) {
@@ -220,6 +234,7 @@ class TunecVpnService : VpnService() {
         val flags = buf.get(ihl + 13).toInt() and 0xFF
         val syn = flags and 0x02 != 0
         val ack = flags and 0x10 != 0
+        val fin = flags and 0x01 != 0
         val payloadOff = ihl + dataOff
         val payloadLen = (len - payloadOff).coerceAtLeast(0)
 
@@ -256,15 +271,43 @@ class TunecVpnService : VpnService() {
         // Update expected app seq
         if (payloadLen > 0) state.appSeq.set((seq.toLong() and 0xFFFFFFFFL) + payloadLen)
 
-        // Forward payload via executor
+        // Forward payload: batch by connection, flush on size or timer
         if (payloadLen > 0) {
             val payload = ByteArray(payloadLen)
             buf.position(payloadOff); buf.get(payload)
             Log.i(TAG, "OUT  DATA → ${formatIp(dstIp)}:$dstPort len=$payloadLen")
-            val request = RelayRequest.Data(key, payload)
-            relayClient?.handleRequest(request.serialize())
             // ACK to the app so it doesn't retransmit (prevents duplicate data → BAD_RECORD_MAC)
             writeAckOnly(state, output)
+            val batch = outboundBatches.getOrPut(key) { OutboundBatch() }
+            batch.add(payload)
+            if (batch.size() >= BATCH_SIZE_THRESHOLD) {
+                flushOutbound(key)
+            } else if (fin) {
+                // Flush immediately on FIN so upload end is not delayed by timer
+                flushOutbound(key)
+                relayClient?.sendShutdownWrite(key)
+            } else {
+                scheduleFlush(key)
+            }
+        } else if (fin) {
+            // FIN-only segment: flush any buffered data, then half-close so server sees EOF
+            flushOutbound(key)
+            relayClient?.sendShutdownWrite(key)
+        }
+    }
+
+    private fun flushOutbound(key: String) {
+        val batch = outboundBatches[key] ?: return
+        val payload = batch.takeAndClear() ?: return
+        batch.getPendingFlush()?.let { batchHandler.removeCallbacks(it) }
+        batch.setPendingFlush(null)
+        relayClient?.handleRequest(RelayRequest.Data(key, payload).serialize())
+    }
+
+    private fun scheduleFlush(key: String) {
+        val batch = outboundBatches[key] ?: return
+        batch.scheduleFlushIfNeeded(batchHandler, BATCH_FLUSH_DELAY_MS) {
+            flushOutbound(key)
         }
     }
 
@@ -288,10 +331,12 @@ class TunecVpnService : VpnService() {
                 }
             }
             is RelayResponse.Disconnected -> {
+                outboundBatches.remove(response.connectionId)?.getPendingFlush()?.let { batchHandler.removeCallbacks(it) }
                 connections.remove(response.connectionId)
                 Log.i(TAG, "Connection closed: ${response.connectionId}")
             }
             is RelayResponse.Error -> {
+                outboundBatches.remove(response.connectionId)?.getPendingFlush()?.let { batchHandler.removeCallbacks(it) }
                 connections.remove(response.connectionId)
                 Log.e(TAG, "Relay error ${response.connectionId}: ${response.message}")
             }
@@ -421,5 +466,31 @@ class TunecVpnService : VpnService() {
     ) {
         val appSeq = AtomicLong(0)
         val ourSeq = AtomicLong(2)  // SYN-ACK ISN=1 consumes 1 seq, so first data byte = 2
+    }
+
+    /** Per-connection outbound buffer for batching Data payloads to AppBack. */
+    private class OutboundBatch {
+        private val buffer = ByteArrayOutputStream()
+        private val lock = Any()
+        @Volatile private var pendingFlushRunnable: Runnable? = null
+
+        fun add(payload: ByteArray) = synchronized(lock) { buffer.write(payload) }
+        fun size(): Int = synchronized(lock) { buffer.size() }
+        fun takeAndClear(): ByteArray? = synchronized(lock) {
+            if (buffer.size() == 0) null else buffer.toByteArray().also { buffer.reset() }
+        }
+
+        fun getPendingFlush(): Runnable? = pendingFlushRunnable
+        fun setPendingFlush(r: Runnable?) { pendingFlushRunnable = r }
+
+        fun scheduleFlushIfNeeded(handler: Handler, delayMs: Long, flushAction: Runnable) {
+            synchronized(lock) {
+                if (pendingFlushRunnable != null) return
+                pendingFlushRunnable = Runnable {
+                    flushAction.run()
+                }
+                handler.postDelayed(pendingFlushRunnable!!, delayMs)
+            }
+        }
     }
 }

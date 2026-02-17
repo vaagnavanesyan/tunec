@@ -122,6 +122,15 @@ class WebSocketRelayClient(
         }
     }
 
+    /** Tell AppBack to half-close the socket (client finished sending; server can still respond). */
+    fun sendShutdownWrite(connectionId: String) {
+        val json = JSONObject().apply {
+            put("type", "shutdown_write")
+            put("connectionId", connectionId)
+        }
+        ws.send(json.toString())
+    }
+
     /** Shut down the WebSocket and release resources. */
     fun shutdown() {
         ws.close(1000, "VPN stopping")
