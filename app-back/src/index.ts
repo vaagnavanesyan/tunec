@@ -2,7 +2,7 @@ import express from "express";
 import { createServer } from "node:http";
 import { WebSocketServer, WebSocket } from "ws";
 import { RelayManager } from "./relay.js";
-import type { RelayRequest } from "./types.js";
+import { parseRequest, serializeResponse } from "./protocol.js";
 
 const PORT = Number(process.env.PORT) || 3000;
 const TAG = "AppBack";
@@ -24,15 +24,17 @@ wss.on("connection", (ws: WebSocket) => {
 
   const relay = new RelayManager((response) => {
     if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify(response));
+      ws.send(serializeResponse(response));
     }
   });
 
   ws.on("message", (raw: Buffer | string) => {
+    if (!Buffer.isBuffer(raw)) {
+      console.warn(`[${TAG}] Ignoring non-binary message`);
+      return;
+    }
     try {
-      const text = typeof raw === "string" ? raw : raw.toString("utf-8");
-      const request: RelayRequest = JSON.parse(text);
-      //  console.log(`[${TAG}] ← ${request.type} ${request.connectionId}`);
+      const request = parseRequest(raw);
       relay.handleRequest(request);
     } catch (err) {
       console.error(`[${TAG}] Invalid message:`, err);

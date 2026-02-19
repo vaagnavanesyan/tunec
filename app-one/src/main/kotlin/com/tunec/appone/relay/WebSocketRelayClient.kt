@@ -1,13 +1,12 @@
 package com.tunec.appone.relay
 
-import android.util.Base64
 import android.util.Log
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
-import org.json.JSONObject
+import okio.ByteString
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
@@ -17,9 +16,8 @@ private const val TAG = "WsRelay"
 /**
  * WebSocket-based relay client that replaces the in-process [RelayExecutor].
  *
- * Sends [RelayRequest] messages as JSON to AppBack over a persistent WebSocket
- * connection and converts incoming JSON responses back to serialized
- * [RelayResponse] bytes for the VPN service.
+ * Sends [RelayRequest] messages as binary (format from RelayMessage.kt) to AppBack and
+ * receives binary [RelayResponse] frames, passing them through to the VPN service.
  *
  * @param serverUrl  WebSocket URL of AppBack (e.g. `ws://192.168.1.100:3000`)
  * @param protectSocket  VPN protect callback — applied to the OkHttp client's underlying socket
@@ -50,8 +48,8 @@ class WebSocketRelayClient(
                 Log.i(TAG, "WebSocket connected to $serverUrl")
             }
 
-            override fun onMessage(webSocket: WebSocket, text: String) {
-                handleMessage(text)
+            override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+                handleMessage(bytes.toByteArray())
             }
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
@@ -77,23 +75,17 @@ class WebSocketRelayClient(
     /**
      * Handle a serialized [RelayRequest].
      *
-     * - **Connect**: sends JSON, blocks until "connected"/"error" response arrives.
+     * - **Connect**: sends binary, blocks until "connected"/"error" response arrives.
      *   Returns serialized [RelayResponse.Connected] or [RelayResponse.Error].
-     * - **Data** / **Disconnect**: sends JSON, returns `null` immediately.
+     * - **Data** / **Disconnect**: sends binary, returns `null` immediately.
      */
     fun handleRequest(serialized: ByteArray): ByteArray? {
         val request = RelayRequest.deserialize(serialized)
         return when (request) {
             is RelayRequest.Connect -> {
-                val json = JSONObject().apply {
-                    put("type", "connect")
-                    put("connectionId", request.connectionId)
-                    put("destIp", request.destIp)
-                    put("destPort", request.destPort)
-                }
                 val future = CompletableFuture<ByteArray>()
                 pendingConnects[request.connectionId] = future
-                ws.send(json.toString())
+                ws.send(ByteString.of(*serialized))
                 try {
                     future.get(10, TimeUnit.SECONDS)
                 } catch (e: Exception) {
@@ -103,20 +95,15 @@ class WebSocketRelayClient(
                 }
             }
             is RelayRequest.Data -> {
-                val json = JSONObject().apply {
-                    put("type", "data")
-                    put("connectionId", request.connectionId)
-                    put("payload", Base64.encodeToString(request.payload, Base64.NO_WRAP))
-                }
-                ws.send(json.toString())
+                ws.send(ByteString.of(*serialized))
                 null
             }
             is RelayRequest.Disconnect -> {
-                val json = JSONObject().apply {
-                    put("type", "disconnect")
-                    put("connectionId", request.connectionId)
-                }
-                ws.send(json.toString())
+                ws.send(ByteString.of(*serialized))
+                null
+            }
+            is RelayRequest.ShutdownWrite -> {
+                ws.send(ByteString.of(*serialized))
                 null
             }
         }
@@ -124,11 +111,8 @@ class WebSocketRelayClient(
 
     /** Tell AppBack to half-close the socket (client finished sending; server can still respond). */
     fun sendShutdownWrite(connectionId: String) {
-        val json = JSONObject().apply {
-            put("type", "shutdown_write")
-            put("connectionId", connectionId)
-        }
-        ws.send(json.toString())
+        val bytes = RelayRequest.ShutdownWrite(connectionId).serialize()
+        ws.send(ByteString.of(*bytes))
     }
 
     /** Shut down the WebSocket and release resources. */
@@ -139,47 +123,36 @@ class WebSocketRelayClient(
 
     // ── Internal ────────────────────────────────────────────────────────────
 
-    private fun handleMessage(text: String) {
+    private fun handleMessage(bytes: ByteArray) {
         try {
-            val json = JSONObject(text)
-            val type = json.getString("type")
-            val connectionId = json.getString("connectionId")
-
-            when (type) {
-                "connected" -> {
-                    val responseBytes = RelayResponse.Connected(connectionId).serialize()
-                    val future = pendingConnects.remove(connectionId)
+            val response = RelayResponse.deserialize(bytes)
+            when (response) {
+                is RelayResponse.Connected -> {
+                    val future = pendingConnects.remove(response.connectionId)
                     if (future != null) {
-                        future.complete(responseBytes)
+                        future.complete(bytes)
                     } else {
-                        onResponse(responseBytes)
+                        onResponse(bytes)
                     }
                 }
-                "data" -> {
-                    val payload = Base64.decode(json.getString("payload"), Base64.NO_WRAP)
-                    onResponse(RelayResponse.Data(connectionId, payload).serialize())
-                }
-                "disconnected" -> {
-                    onResponse(RelayResponse.Disconnected(connectionId).serialize())
-                    // Also fail any pending connect
-                    pendingConnects.remove(connectionId)?.completeExceptionally(
+                is RelayResponse.Data -> onResponse(bytes)
+                is RelayResponse.Disconnected -> {
+                    onResponse(bytes)
+                    pendingConnects.remove(response.connectionId)?.completeExceptionally(
                         Exception("disconnected before connected")
                     )
                 }
-                "error" -> {
-                    val message = json.getString("message")
-                    val responseBytes = RelayResponse.Error(connectionId, message).serialize()
-                    val future = pendingConnects.remove(connectionId)
+                is RelayResponse.Error -> {
+                    val future = pendingConnects.remove(response.connectionId)
                     if (future != null) {
-                        future.complete(responseBytes)
+                        future.complete(bytes)
                     } else {
-                        onResponse(responseBytes)
+                        onResponse(bytes)
                     }
                 }
-                else -> Log.w(TAG, "Unknown message type: $type")
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to parse message: $text", e)
+            Log.e(TAG, "Failed to parse binary message", e)
         }
     }
 

@@ -44,6 +44,7 @@ class RelayExecutor(
             is RelayRequest.Connect -> handleConnect(request)
             is RelayRequest.Data -> { handleData(request); null }
             is RelayRequest.Disconnect -> { handleDisconnect(request); null }
+            is RelayRequest.ShutdownWrite -> { handleShutdownWrite(request); null }
         }
     }
 
@@ -101,6 +102,16 @@ class RelayExecutor(
         if (socket != null) {
             try { socket.close() } catch (_: Exception) {}
             Log.i(TAG, "Disconnected ${req.connectionId}")
+        }
+    }
+
+    private fun handleShutdownWrite(req: RelayRequest.ShutdownWrite) {
+        val socket = connections[req.connectionId]
+        if (socket != null) {
+            try {
+                socket.shutdownOutput()
+                Log.i(TAG, "Shutdown write ${req.connectionId}")
+            } catch (_: Exception) {}
         }
     }
 

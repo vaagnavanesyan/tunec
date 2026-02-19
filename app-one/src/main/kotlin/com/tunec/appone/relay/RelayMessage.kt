@@ -30,6 +30,10 @@ sealed class RelayRequest {
         override val connectionId: String
     ) : RelayRequest()
 
+    data class ShutdownWrite(
+        override val connectionId: String
+    ) : RelayRequest()
+
     fun serialize(): ByteArray {
         return when (this) {
             is Connect -> {
@@ -60,6 +64,14 @@ sealed class RelayRequest {
                     .putShort(idBytes.size.toShort()).put(idBytes)
                     .array()
             }
+            is ShutdownWrite -> {
+                val idBytes = connectionId.toByteArray(Charsets.UTF_8)
+                ByteBuffer.allocate(1 + 2 + idBytes.size)
+                    .order(ByteOrder.BIG_ENDIAN)
+                    .put(TYPE_SHUTDOWN_WRITE)
+                    .putShort(idBytes.size.toShort()).put(idBytes)
+                    .array()
+            }
         }
     }
 
@@ -67,6 +79,7 @@ sealed class RelayRequest {
         private const val TYPE_CONNECT: Byte = 0x01
         private const val TYPE_DATA: Byte = 0x02
         private const val TYPE_DISCONNECT: Byte = 0x03
+        private const val TYPE_SHUTDOWN_WRITE: Byte = 0x04
 
         fun deserialize(bytes: ByteArray): RelayRequest {
             val buf = ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN)
@@ -85,6 +98,10 @@ sealed class RelayRequest {
                 TYPE_DISCONNECT -> {
                     val id = readString(buf)
                     Disconnect(id)
+                }
+                TYPE_SHUTDOWN_WRITE -> {
+                    val id = readString(buf)
+                    ShutdownWrite(id)
                 }
                 else -> throw IllegalArgumentException("Unknown RelayRequest type")
             }

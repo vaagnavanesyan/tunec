@@ -99,7 +99,7 @@ export class RelayManager {
     socket.setNoDelay(true);
 
     socket.on("data", (chunk: Buffer) => {
-      //console.log(`[${TAG}] IN DATA ← ${connectionId} len=${chunk.length}`);
+      console.log(`[${TAG}] IN DATA ← ${connectionId} len=${chunk.length}`);
       const state = this.inboundState.get(connectionId);
       if (!state) return;
       state.buffer.push(chunk);
