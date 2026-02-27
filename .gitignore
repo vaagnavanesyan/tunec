@@ -41,3 +41,4 @@ proguard/
 
 # Logs
 *.log
+rtmp-push/input.flv
