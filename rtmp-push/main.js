@@ -1,13 +1,13 @@
-const { FlvReader } = require("./flv-reader");
+const { generateTags } = require("./image-source");
 const { RtmpClient } = require("./rtmp-client");
 const { createPipeline, tapLog } = require("./transforms");
 
-const serverUrl = "rtmp://rtmp-lb-a.ntv.rutube.ru/live_push";
+const serverUrl = "rtmp://rtmp-lb-b.dth.rutube.ru/live_push";
 const streamKey =
-  "1f2755edf3b021341ba36683641f7e9a?sinfo=xPRd97SOxYVNaC1NRPJ4tBK2XXPZYAQ";
+  "49fa91ec0faeb817ed2a713064af6cc6?sinfo=Ep8O0NuMlYPYzhZylz22iXrwNNlePxyZ";
 const rtmpUrl = `${serverUrl}/${streamKey}`;
 
-const inputSource = "input.flv";
+const inputSource = "input.bmp";
 
 function parseRtmpUrl(url) {
   const match = url.match(/^rtmp:\/\/([^/:]+)(?::(\d+))?\/([\w_-]+)\/(.*)/);
@@ -54,20 +54,13 @@ async function main() {
   // Small delay to let the server process the publish command
   await sleep(100);
 
-  const flv = new FlvReader(inputSource);
-  const header = flv.open();
-  console.log(
-    `FLV: v${header.version}, audio=${header.hasAudio}, video=${header.hasVideo}`
-  );
-
   const startTime = Date.now();
   let tagCount = 0;
 
-  for (const tag of flv.tags()) {
+  for await (const tag of generateTags(inputSource, { fps: 1 })) {
     const transformed = transform(tag);
     if (!transformed) continue;
 
-    // Real-time pacing: wait until the tag's timestamp
     const elapsed = Date.now() - startTime;
     const delay = transformed.timestamp - elapsed;
     if (delay > 0) await sleep(delay);
@@ -76,9 +69,7 @@ async function main() {
     tagCount++;
   }
 
-  flv.close();
   console.log(`Done. Sent ${tagCount} tags.`);
-
   await sleep(1000);
   client.close();
 }

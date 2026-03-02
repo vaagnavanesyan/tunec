@@ -47,6 +47,19 @@ function encodeObject(obj) {
   return Buffer.concat(parts);
 }
 
+function encodeEcmaArray(obj) {
+  const entries = Object.entries(obj);
+  const count = Buffer.alloc(5);
+  count[0] = AMF0_ECMA_ARRAY;
+  count.writeUInt32BE(entries.length, 1);
+  const parts = [count];
+  for (const [key, value] of entries) {
+    parts.push(encodeObjectProperty(key, value));
+  }
+  parts.push(Buffer.from([0x00, 0x00, AMF0_OBJECT_END]));
+  return Buffer.concat(parts);
+}
+
 function encodeNull() {
   return Buffer.from([AMF0_NULL]);
 }
@@ -138,4 +151,4 @@ function decode(buf, offset = 0) {
   return values;
 }
 
-module.exports = { encode, decode, encodeValue, decodeValue };
+module.exports = { encode, decode, encodeValue, encodeEcmaArray, decodeValue };
