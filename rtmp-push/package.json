@@ -16,5 +16,8 @@
   "type": "commonjs",
   "devDependencies": {
     "node-media-server": "^4.2.4"
+  },
+  "dependencies": {
+    "amf-codec": "^1.4.0"
   }
 }
