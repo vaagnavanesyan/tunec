@@ -1,6 +1,5 @@
 const { generateTags } = require("./image-source");
 const { RtmpClient } = require("./rtmp-client");
-const { createPipeline, tapLog } = require("./transforms");
 
 const serverUrl = "rtmp://rtmp-lb-a.dth.rutube.ru/live_push";
 const streamKey =
@@ -24,14 +23,6 @@ function parseRtmpUrl(url) {
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
-
-const transform = createPipeline(
-  tapLog("SEND")
-  // Add transforms here, for example:
-  // timeScale(1.0),
-  // stripAudio(),
-  // mapData((buf, tag) => { /* modify bytes */ return buf; }),
-);
 
 async function main() {
   const { host, port, app, streamPath, tcUrl } = parseRtmpUrl(rtmpUrl);
@@ -61,14 +52,11 @@ async function main() {
     fps: 1,
     messagePath: "message.bin",
   })) {
-    const transformed = transform(tag);
-    if (!transformed) continue;
-
     const elapsed = Date.now() - startTime;
-    const delay = transformed.timestamp - elapsed;
+    const delay = tag.timestamp - elapsed;
     if (delay > 0) await sleep(delay);
 
-    client.sendTag(transformed);
+    client.sendTag(tag);
     tagCount++;
   }
 

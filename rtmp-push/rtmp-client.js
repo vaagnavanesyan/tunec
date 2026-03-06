@@ -223,7 +223,12 @@ class RtmpClient extends EventEmitter {
 
     if (accumulated.length >= messageLength) {
       this.chunkBodies.delete(bodyKey);
-      this._handleMessage(messageTypeId, accumulated, messageStreamId, timestamp);
+      this._handleMessage(
+        messageTypeId,
+        accumulated,
+        messageStreamId,
+        timestamp
+      );
     } else {
       this.chunkBodies.set(bodyKey, accumulated);
     }
@@ -446,15 +451,14 @@ class RtmpClient extends EventEmitter {
   }
 
   sendTag(tag) {
-    const { TAG_TYPE_AUDIO, TAG_TYPE_VIDEO, TAG_TYPE_SCRIPT } = require("./flv-reader");
     switch (tag.type) {
-      case TAG_TYPE_AUDIO:
+      case MSG_AUDIO:
         this.sendAudio(tag.timestamp, tag.data);
         break;
-      case TAG_TYPE_VIDEO:
+      case MSG_VIDEO:
         this.sendVideo(tag.timestamp, tag.data);
         break;
-      case TAG_TYPE_SCRIPT:
+      case MSG_DATA_AMF0:
         this.sendMetadata(tag.data);
         break;
     }
