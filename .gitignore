@@ -42,3 +42,4 @@ proguard/
 # Logs
 *.log
 rtmp-push/input.flv
+rtmp-push/node_modules

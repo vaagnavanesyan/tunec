@@ -1,14 +1,11 @@
 const { generateTags } = require("./image-source");
 const { RtmpClient } = require("./rtmp-client");
 
-const DEFAULT_SERVER = "rtmp://rtmp-lb-a.dth.rutube.ru/live_push";
-const DEFAULT_KEY =
-  "64e27a22cf18d510494937bedcbaee2a?sinfo=MKnxLetajRLO5TzvXQPwfz4AwKdAXda";
+const DEFAULT_URL = "rtmp://localhost:1935/live/test";
 
-const rtmpUrl =
-  process.argv[2] || process.env.RTMP_URL || `${DEFAULT_SERVER}/${DEFAULT_KEY}`;
-
+const rtmpUrl = process.argv[2] || process.env.RTMP_URL || DEFAULT_URL;
 const inputSource = process.argv[3] || "input.bmp";
+const messagePath = process.argv[4] || "message.bin";
 
 function parseRtmpUrl(url) {
   const match = url.match(/^rtmp:\/\/([^/:]+)(?::(\d+))?\/([\w_-]+)\/(.*)/);
@@ -28,7 +25,9 @@ function sleep(ms) {
 
 async function main() {
   const { host, port, app, streamPath, tcUrl } = parseRtmpUrl(rtmpUrl);
-  console.log(`Connecting to ${host}:${port}, app=${app}`);
+  console.log(`Pushing to ${rtmpUrl}`);
+  console.log(`  host=${host} port=${port} app=${app} stream=${streamPath}`);
+  console.log(`  input=${inputSource} message=${messagePath}`);
 
   const client = new RtmpClient();
 
@@ -43,8 +42,6 @@ async function main() {
   console.log(`Stream created (id=${client.streamId}), publishing...`);
 
   client.publish(streamPath);
-
-  // Small delay to let the server process the publish command
   await sleep(100);
 
   const startTime = Date.now();
@@ -52,7 +49,7 @@ async function main() {
 
   for await (const tag of generateTags(inputSource, {
     fps: 1,
-    messagePath: "message.bin",
+    messagePath,
   })) {
     const elapsed = Date.now() - startTime;
     const delay = tag.timestamp - elapsed;

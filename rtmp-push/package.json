@@ -4,10 +4,17 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "server": "node local-server.js",
+    "local:push": "node local-push.js",
+    "local:receive": "node local-receive.js",
+    "local:test": "node local-test.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "type": "commonjs"
+  "type": "commonjs",
+  "devDependencies": {
+    "node-media-server": "^4.2.4"
+  }
 }
