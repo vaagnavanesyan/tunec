@@ -86,8 +86,7 @@ class FlvStreamReader {
     const headerBuf = this._consume(TAG_HEADER_SIZE);
 
     const type = headerBuf[0] & 0x1f;
-    const dataSize =
-      (headerBuf[1] << 16) | (headerBuf[2] << 8) | headerBuf[3];
+    const dataSize = (headerBuf[1] << 16) | (headerBuf[2] << 8) | headerBuf[3];
     const timestamp =
       (headerBuf[4] << 16) |
       (headerBuf[5] << 8) |
@@ -112,7 +111,7 @@ function getStderr(chunks) {
 }
 
 async function* generateTags(filePath, { fps = 1, messagePath } = {}) {
-  const keyframeInterval = Math.max(1, fps * 5);
+  const keyframeInterval = 1;
 
   let inputPath = filePath;
   let tmpFile = null;
@@ -129,16 +128,26 @@ async function* generateTags(filePath, { fps = 1, messagePath } = {}) {
   const ffmpeg = spawn(
     "ffmpeg",
     [
-      "-loop", "1",
-      "-i", inputPath,
-      "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
-      "-c:v", "libx264",
-      "-preset", "ultrafast",
-      "-tune", "stillimage",
-      "-pix_fmt", "yuv420p",
-      "-r", String(fps),
-      "-g", String(keyframeInterval),
-      "-f", "flv",
+      "-loop",
+      "1",
+      "-i",
+      inputPath,
+      "-vf",
+      "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+      "-c:v",
+      "libx264",
+      "-preset",
+      "ultrafast",
+      "-tune",
+      "stillimage",
+      "-pix_fmt",
+      "yuv420p",
+      "-r",
+      String(fps),
+      "-g",
+      String(keyframeInterval),
+      "-f",
+      "flv",
       "-an",
       "pipe:1",
     ],
@@ -169,7 +178,9 @@ async function* generateTags(filePath, { fps = 1, messagePath } = {}) {
     if (!header) {
       const { code, signal } = await ffmpegExit;
       throw new Error(
-        `ffmpeg produced no output (code=${code}, signal=${signal}):\n${getStderr(stderrChunks)}`
+        `ffmpeg produced no output (code=${code}, signal=${signal}):\n${getStderr(
+          stderrChunks
+        )}`
       );
     }
 
@@ -191,7 +202,9 @@ async function* generateTags(filePath, { fps = 1, messagePath } = {}) {
   } finally {
     ffmpeg.kill();
     if (tmpFile) {
-      try { fs.unlinkSync(tmpFile); } catch (_) {}
+      try {
+        fs.unlinkSync(tmpFile);
+      } catch (_) {}
     }
   }
 }
