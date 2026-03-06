@@ -1,3 +1,4 @@
+const fs = require("fs");
 const { generateTags } = require("./image-source");
 const { RtmpClient } = require("./rtmp-client");
 
@@ -44,12 +45,15 @@ async function main() {
   client.publish(streamPath);
   await sleep(100);
 
+  const msgSize = fs.statSync(messagePath).size;
   const startTime = Date.now();
   let tagCount = 0;
+  let videoBytes = 0;
 
   for await (const tag of generateTags(inputSource, {
-    fps: 1,
+    fps: 10,
     messagePath,
+    holdSeconds: 10,
   })) {
     const elapsed = Date.now() - startTime;
     const delay = tag.timestamp - elapsed;
@@ -57,9 +61,15 @@ async function main() {
 
     client.sendTag(tag);
     tagCount++;
+    videoBytes += tag.data.length;
   }
 
-  console.log(`Done. Sent ${tagCount} tags.`);
+  const elapsedMs = Date.now() - startTime;
+  const elapsedSec = elapsedMs / 1000;
+  console.log(`\nDone. Sent ${tagCount} tags in ${elapsedSec.toFixed(1)}s`);
+  console.log(`  hidden payload : ${msgSize} bytes`);
+  console.log(`  video sent     : ${(videoBytes / 1024).toFixed(1)} KB`);
+  console.log(`  throughput     : ${(msgSize / elapsedSec).toFixed(0)} bytes/s (payload), ${(videoBytes / 1024 / elapsedSec).toFixed(1)} KB/s (video)`);
   await sleep(1000);
   client.close();
 }

@@ -3,35 +3,37 @@ const path = require("path");
 
 const RTMP_URL = "rtmp://localhost:1935/live/test";
 const SETTLE_MS = 2000;
-const RECEIVE_DELAY_MS = 3000;
+const RECEIVE_DELAY_MS = 5000;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function run(script, args = []) {
-  return new Promise((resolve, reject) => {
-    const label = path.basename(script, ".js");
-    const child = spawn(process.execPath, [script, ...args], {
-      cwd: __dirname,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+  const label = path.basename(script, ".js");
+  const child = spawn(process.execPath, [script, ...args], {
+    cwd: __dirname,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
 
-    child.stdout.on("data", (d) => {
-      for (const line of d.toString().trimEnd().split("\n")) {
-        console.log(`[${label}] ${line}`);
-      }
-    });
+  child.stdout.on("data", (d) => {
+    for (const line of d.toString().trimEnd().split("\n")) {
+      console.log(`[${label}] ${line}`);
+    }
+  });
 
-    child.stderr.on("data", (d) => {
-      for (const line of d.toString().trimEnd().split("\n")) {
-        console.error(`[${label}] ${line}`);
-      }
-    });
+  child.stderr.on("data", (d) => {
+    for (const line of d.toString().trimEnd().split("\n")) {
+      console.error(`[${label}] ${line}`);
+    }
+  });
 
+  const done = new Promise((resolve, reject) => {
     child.on("error", reject);
     child.on("close", (code) => resolve(code));
   });
+
+  return { child, done };
 }
 
 async function main() {
@@ -66,17 +68,18 @@ async function main() {
 
   try {
     console.log("\n=== Starting push ===");
-    const pushDone = run("local-push.js", [RTMP_URL]);
+    const push = run("local-push.js", [RTMP_URL]);
 
     await sleep(RECEIVE_DELAY_MS);
 
     console.log("\n=== Starting receive ===");
-    const receiveCode = await run("local-receive.js", [RTMP_URL]);
+    const receiveCode = await run("local-receive.js", [RTMP_URL]).done;
 
-    const pushCode = await pushDone;
+    push.child.kill();
+    const pushCode = await push.done;
 
     console.log("\n=== Results ===");
-    console.log(`  push   : exit code ${pushCode}`);
+    console.log(`  push   : exit code ${pushCode ?? "killed"}`);
     console.log(`  receive: exit code ${receiveCode}`);
 
     if (receiveCode === 0) {

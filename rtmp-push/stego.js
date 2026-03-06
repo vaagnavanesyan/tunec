@@ -6,7 +6,9 @@ const HALF_Q = Q / 2;
 const QUARTER_Q = Q / 4;
 const BLOCK = 8;
 const REPS = 3;
-const HEADER_BYTES = 4 + 4; // magic + length
+const UTILIZATION = 0.9;
+// MAGIC(4) + chunk_index(2) + total_chunks(2) + chunk_data_length(4)
+const HEADER_BYTES = 4 + 2 + 2 + 4;
 const CRC_BYTES = 4;
 const FRAME_OVERHEAD = HEADER_BYTES + CRC_BYTES;
 
@@ -86,7 +88,15 @@ function qimDecode(v) {
 
 // --- Public API ---
 
-function embedMessage(bmpBuffer, messageBuffer) {
+function maxPayload(bmpBuffer) {
+  const hdr = parseBmpHeader(bmpBuffer);
+  const bCols = Math.floor(hdr.width / BLOCK);
+  const bRows = Math.floor(hdr.height / BLOCK);
+  const usableBlocks = Math.floor(bCols * bRows * UTILIZATION);
+  return Math.floor(usableBlocks / REPS / 8) - FRAME_OVERHEAD;
+}
+
+function embedChunk(bmpBuffer, chunkData, chunkIndex, totalChunks) {
   const buf = Buffer.from(bmpBuffer);
   const hdr = parseBmpHeader(buf);
 
@@ -94,26 +104,23 @@ function embedMessage(bmpBuffer, messageBuffer) {
   const bRows = Math.floor(hdr.height / BLOCK);
   const totalBlocks = bCols * bRows;
 
-  const frame = Buffer.alloc(FRAME_OVERHEAD + messageBuffer.length);
+  const frame = Buffer.alloc(FRAME_OVERHEAD + chunkData.length);
   MAGIC.copy(frame, 0);
-  frame.writeUInt32LE(messageBuffer.length, 4);
-  messageBuffer.copy(frame, HEADER_BYTES);
-  frame.writeUInt32LE(crc32(messageBuffer), HEADER_BYTES + messageBuffer.length);
+  frame.writeUInt16LE(chunkIndex, 4);
+  frame.writeUInt16LE(totalChunks, 6);
+  frame.writeUInt32LE(chunkData.length, 8);
+  chunkData.copy(frame, HEADER_BYTES);
+  frame.writeUInt32LE(crc32(chunkData), HEADER_BYTES + chunkData.length);
 
   const bits = toBits(frame);
   const needed = bits.length * REPS;
 
   if (needed > totalBlocks) {
-    const maxPayload = Math.floor(totalBlocks / REPS / 8) - FRAME_OVERHEAD;
+    const max = Math.floor(totalBlocks / REPS / 8) - FRAME_OVERHEAD;
     throw new Error(
-      `Message too large: need ${needed} blocks, have ${totalBlocks} (max ~${maxPayload} bytes)`
+      `Chunk too large: need ${needed} blocks, have ${totalBlocks} (max ~${max} bytes)`
     );
   }
-
-  console.log(
-    `Stego embed: ${messageBuffer.length}B payload, ` +
-    `${bits.length} frame bits, ${needed}/${totalBlocks} blocks used`
-  );
 
   let blockIdx = 0;
   for (let i = 0; i < bits.length; i++) {
@@ -133,7 +140,7 @@ function embedMessage(bmpBuffer, messageBuffer) {
   return buf;
 }
 
-function extractMessage(bmpBuffer) {
+function extractChunk(bmpBuffer) {
   const hdr = parseBmpHeader(bmpBuffer);
 
   const bCols = Math.floor(hdr.width / BLOCK);
@@ -162,7 +169,6 @@ function extractMessage(bmpBuffer) {
     return ones > REPS / 2 ? 1 : 0;
   }
 
-  // Decode header first to learn payload length
   const headerBitCount = HEADER_BYTES * 8;
   const headerNeeded = headerBitCount * REPS;
   if (totalBlocks < headerNeeded) throw new Error("Image too small for stego header");
@@ -175,13 +181,16 @@ function extractMessage(bmpBuffer) {
     throw new Error(`No stego message found (magic: 0x${headerBuf.subarray(0, 4).toString("hex")})`);
   }
 
-  const payloadLen = headerBuf.readUInt32LE(4);
-  const frameBytesTotal = FRAME_OVERHEAD + payloadLen;
+  const chunkIndex = headerBuf.readUInt16LE(4);
+  const totalChunks = headerBuf.readUInt16LE(6);
+  const chunkLen = headerBuf.readUInt32LE(8);
+
+  const frameBytesTotal = FRAME_OVERHEAD + chunkLen;
   const frameBitCount = frameBytesTotal * 8;
   const frameNeeded = frameBitCount * REPS;
 
   if (totalBlocks < frameNeeded) {
-    throw new Error(`Payload claims ${payloadLen} bytes but not enough blocks`);
+    throw new Error(`Chunk claims ${chunkLen} bytes but not enough blocks`);
   }
 
   const frameBits = new Uint8Array(frameBitCount);
@@ -189,17 +198,48 @@ function extractMessage(bmpBuffer) {
   for (let i = headerBitCount; i < frameBitCount; i++) frameBits[i] = decodeBit(i);
   const frameBuf = fromBits(frameBits, frameBytesTotal);
 
-  const payload = frameBuf.subarray(HEADER_BYTES, HEADER_BYTES + payloadLen);
-  const storedCrc = frameBuf.readUInt32LE(HEADER_BYTES + payloadLen);
-  const actualCrc = crc32(payload);
+  const data = frameBuf.subarray(HEADER_BYTES, HEADER_BYTES + chunkLen);
+  const storedCrc = frameBuf.readUInt32LE(HEADER_BYTES + chunkLen);
+  const actualCrc = crc32(data);
 
   if (storedCrc !== actualCrc) {
     throw new Error(
-      `CRC mismatch: stored=0x${storedCrc.toString(16)}, actual=0x${actualCrc.toString(16)}`
+      `CRC mismatch on chunk ${chunkIndex}: stored=0x${storedCrc.toString(16)}, actual=0x${actualCrc.toString(16)}`
     );
   }
 
-  return payload;
+  return { chunkIndex, totalChunks, data };
 }
 
-module.exports = { embedMessage, extractMessage };
+function prepareChunks(bmpBuffer, messageBuffer) {
+  const cap = maxPayload(bmpBuffer);
+  if (cap <= 0) throw new Error("Image too small for any stego payload");
+
+  const totalChunks = Math.ceil(messageBuffer.length / cap);
+  console.log(
+    `Splitting ${messageBuffer.length}B message into ${totalChunks} chunk(s), ` +
+    `max ${cap}B per frame`
+  );
+
+  const chunks = [];
+  for (let i = 0; i < totalChunks; i++) {
+    const start = i * cap;
+    const end = Math.min(start + cap, messageBuffer.length);
+    chunks.push(messageBuffer.subarray(start, end));
+  }
+  return { chunks, totalChunks };
+}
+
+function reassembleChunks(chunksMap) {
+  const indices = Array.from(chunksMap.keys()).sort((a, b) => a - b);
+  const parts = indices.map((i) => chunksMap.get(i));
+  return Buffer.concat(parts);
+}
+
+module.exports = {
+  maxPayload,
+  embedChunk,
+  extractChunk,
+  prepareChunks,
+  reassembleChunks,
+};

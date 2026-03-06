@@ -1,123 +1,154 @@
 const fs = require("fs");
 const { spawn } = require("child_process");
-const { extractMessage } = require("./stego");
+const { extractChunk, reassembleChunks } = require("./stego");
 
 const DEFAULT_URL =
   "https://bl.rutube.ru/livestream/64e27a22cf18d510494937bedcbaee2a/index.m3u8?s=J_tvCKzuzMfQi9z5fDuI3Q&e=1772536256&scheme=https";
 
-async function grabFrame(source) {
+async function* grabFrames(source, { maxFrames = 256, timeoutMs = 120_000 } = {}) {
   const isFile = fs.existsSync(source) && !source.startsWith("http");
 
   if (isFile && source.endsWith(".bmp")) {
     console.log(`Reading local BMP: ${source}`);
-    return fs.readFileSync(source);
+    yield fs.readFileSync(source);
+    return;
   }
 
-  console.log(`Grabbing frame from: ${source}`);
+  console.log(`Grabbing frames from: ${source}`);
 
   const args = [
-    "-loglevel",
-    "warning",
-    "-rw_timeout",
-    "15000000",
-    "-i",
-    source,
-    "-frames:v",
-    "1",
-    "-f",
-    "image2pipe",
-    "-c:v",
-    "bmp",
+    "-loglevel", "warning",
+    "-rw_timeout", "15000000",
+    "-i", source,
+    "-frames:v", String(maxFrames),
+    "-f", "image2pipe",
+    "-c:v", "bmp",
     "pipe:1",
   ];
 
   const ffmpeg = spawn("ffmpeg", args, { stdio: ["ignore", "pipe", "pipe"] });
 
-  return new Promise((resolve, reject) => {
-    const killTimer = setTimeout(() => {
-      ffmpeg.kill("SIGKILL");
-      reject(new Error("Timeout: ffmpeg did not produce a frame in 120s"));
-    }, 120_000);
+  const killTimer = setTimeout(() => {
+    ffmpeg.kill("SIGKILL");
+  }, timeoutMs);
 
-    const stdoutChunks = [];
-    let totalBytes = 0;
-    let expectedSize = null;
-    let resolved = false;
-
-    ffmpeg.stdout.on("data", (chunk) => {
-      if (resolved) return;
-      stdoutChunks.push(chunk);
-      totalBytes += chunk.length;
-
-      if (expectedSize === null && totalBytes >= 6) {
-        const buf = Buffer.concat(stdoutChunks);
-        if (buf[0] === 0x42 && buf[1] === 0x4d) {
-          expectedSize = buf.readUInt32LE(2);
-          console.log(
-            `BMP header received, expecting ${expectedSize} bytes...`
-          );
-        }
+  const stderrChunks = [];
+  ffmpeg.stderr.on("data", (chunk) => {
+    stderrChunks.push(chunk);
+    const lines = chunk.toString().trim().split("\n");
+    for (const line of lines) {
+      if (
+        line.includes("Opening") ||
+        line.includes("Stream #") ||
+        line.includes("Stream mapping")
+      ) {
+        process.stderr.write(`  [ffmpeg] ${line}\n`);
       }
-
-      if (expectedSize !== null && totalBytes >= expectedSize) {
-        resolved = true;
-        clearTimeout(killTimer);
-        ffmpeg.kill();
-        const bmp = Buffer.concat(stdoutChunks).subarray(0, expectedSize);
-        console.log(`Captured frame: ${bmp.length} bytes`);
-        resolve(bmp);
-      }
-    });
-
-    const stderrChunks = [];
-    ffmpeg.stderr.on("data", (chunk) => {
-      stderrChunks.push(chunk);
-      const lines = chunk.toString().trim().split("\n");
-      for (const line of lines) {
-        if (
-          line.includes("Opening") ||
-          line.includes("Stream #") ||
-          line.includes("Stream mapping")
-        ) {
-          process.stderr.write(`  [ffmpeg] ${line}\n`);
-        }
-      }
-    });
-
-    ffmpeg.on("error", (err) => {
-      if (resolved) return;
-      clearTimeout(killTimer);
-      if (err.code === "ENOENT") {
-        reject(new Error("ffmpeg not found. Install ffmpeg first."));
-      } else {
-        reject(err);
-      }
-    });
-
-    ffmpeg.on("close", (code) => {
-      if (resolved) return;
-      clearTimeout(killTimer);
-      const stderr = Buffer.concat(stderrChunks).toString().trim();
-      const lastLines = stderr.split("\n").slice(-10).join("\n");
-      reject(
-        new Error(
-          `ffmpeg exited with code ${code} before producing a frame:\n${lastLines}`
-        )
-      );
-    });
+    }
   });
+
+  let killed = false;
+  const kill = () => {
+    if (!killed) {
+      killed = true;
+      clearTimeout(killTimer);
+      ffmpeg.kill();
+    }
+  };
+
+  ffmpeg.on("error", (err) => {
+    clearTimeout(killTimer);
+    if (err.code === "ENOENT") {
+      throw new Error("ffmpeg not found. Install ffmpeg first.");
+    }
+    throw err;
+  });
+
+  try {
+    yield* parseBmpStream(ffmpeg.stdout);
+  } finally {
+    kill();
+  }
+}
+
+async function* parseBmpStream(stream) {
+  let buf = Buffer.alloc(0);
+  let done = false;
+  let waitResolve = null;
+
+  stream.on("data", (chunk) => {
+    buf = Buffer.concat([buf, chunk]);
+    if (waitResolve) {
+      const r = waitResolve;
+      waitResolve = null;
+      r();
+    }
+  });
+
+  stream.on("end", () => {
+    done = true;
+    if (waitResolve) {
+      const r = waitResolve;
+      waitResolve = null;
+      r();
+    }
+  });
+
+  async function ensureBytes(n) {
+    while (buf.length < n) {
+      if (done) return false;
+      await new Promise((resolve) => { waitResolve = resolve; });
+    }
+    return true;
+  }
+
+  while (true) {
+    if (!(await ensureBytes(6))) break;
+    if (buf[0] !== 0x42 || buf[1] !== 0x4d) break;
+
+    const bmpSize = buf.readUInt32LE(2);
+    if (!(await ensureBytes(bmpSize))) break;
+
+    const frame = Buffer.from(buf.subarray(0, bmpSize));
+    buf = buf.subarray(bmpSize);
+    yield frame;
+  }
 }
 
 async function main() {
   const source = process.argv[2] || DEFAULT_URL;
 
-  const bmpBuffer = await grabFrame(source);
+  const chunks = new Map();
+  let totalChunks = null;
 
-  const width = bmpBuffer.readInt32LE(18);
-  const height = Math.abs(bmpBuffer.readInt32LE(22));
-  console.log(`Frame dimensions: ${width}x${height}`);
+  for await (const bmpBuffer of grabFrames(source)) {
+    const width = bmpBuffer.readInt32LE(18);
+    const height = Math.abs(bmpBuffer.readInt32LE(22));
+    console.log(`Frame: ${width}x${height}, ${bmpBuffer.length} bytes`);
 
-  const payload = extractMessage(bmpBuffer);
+    try {
+      const { chunkIndex, totalChunks: tc, data } = extractChunk(bmpBuffer);
+      totalChunks = tc;
+      if (!chunks.has(chunkIndex)) {
+        chunks.set(chunkIndex, data);
+        console.log(`  chunk ${chunkIndex + 1}/${tc}: ${data.length} bytes`);
+      } else {
+        console.log(`  chunk ${chunkIndex + 1}/${tc}: duplicate, skipping`);
+      }
+
+      if (chunks.size === totalChunks) break;
+    } catch (err) {
+      console.error(`  stego extraction failed: ${err.message}`);
+    }
+  }
+
+  if (totalChunks === null || chunks.size !== totalChunks) {
+    const got = chunks.size;
+    const expected = totalChunks ?? "?";
+    throw new Error(`Incomplete: received ${got}/${expected} chunks`);
+  }
+
+  const payload = reassembleChunks(chunks);
 
   console.log(`\nDecoded message (${payload.length} bytes):`);
 

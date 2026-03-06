@@ -1,8 +1,6 @@
 const fs = require("fs");
-const os = require("os");
-const path = require("path");
 const { spawn } = require("child_process");
-const { embedMessage } = require("./stego");
+const { prepareChunks, embedChunk } = require("./stego");
 
 const FLV_HEADER_SIZE = 9;
 const TAG_HEADER_SIZE = 11;
@@ -110,54 +108,45 @@ function getStderr(chunks) {
   return full.split("\n").slice(-20).join("\n");
 }
 
-async function* generateTags(filePath, { fps = 1, messagePath } = {}) {
+async function* generateTags(filePath, { fps = 1, messagePath, holdSeconds = 30 } = {}) {
   const keyframeInterval = 1;
+  const bmpBuf = fs.readFileSync(filePath);
 
-  let inputPath = filePath;
-  let tmpFile = null;
-
+  let chunks = null;
+  let totalChunks = 1;
   if (messagePath) {
-    const bmpBuf = fs.readFileSync(filePath);
     const msgBuf = fs.readFileSync(messagePath);
-    const modified = embedMessage(bmpBuf, msgBuf);
-    tmpFile = path.join(os.tmpdir(), `stego-${process.pid}.bmp`);
-    fs.writeFileSync(tmpFile, modified);
-    inputPath = tmpFile;
+    const prepared = prepareChunks(bmpBuf, msgBuf);
+    chunks = prepared.chunks;
+    totalChunks = prepared.totalChunks;
   }
+
+  const minFrames = totalChunks + holdSeconds * fps;
 
   const ffmpeg = spawn(
     "ffmpeg",
     [
-      "-loop",
-      "1",
-      "-i",
-      inputPath,
-      "-vf",
-      "pad=ceil(iw/2)*2:ceil(ih/2)*2",
-      "-c:v",
-      "libx264",
-      "-preset",
-      "ultrafast",
-      "-tune",
-      "stillimage",
-      "-pix_fmt",
-      "yuv420p",
-      "-r",
-      String(fps),
-      "-g",
-      String(keyframeInterval),
-      "-f",
-      "flv",
+      "-f", "image2pipe",
+      "-framerate", String(fps),
+      "-c:v", "bmp",
+      "-i", "pipe:0",
+      "-c:v", "libx264",
+      "-preset", "ultrafast",
+      "-tune", "stillimage",
+      "-crf", "17",
+      "-pix_fmt", "yuv420p",
+      "-r", String(fps),
+      "-g", String(keyframeInterval),
+      "-f", "flv",
       "-an",
       "pipe:1",
     ],
-    { stdio: ["ignore", "pipe", "pipe"] }
+    { stdio: ["pipe", "pipe", "pipe"] }
   );
 
   const stderrChunks = [];
   ffmpeg.stderr.on("data", (chunk) => stderrChunks.push(chunk));
 
-  // Resolves with exit code when ffmpeg finishes (for any reason)
   const ffmpegExit = new Promise((resolve, reject) => {
     ffmpeg.on("error", (err) => {
       if (err.code === "ENOENT") {
@@ -170,6 +159,26 @@ async function* generateTags(filePath, { fps = 1, messagePath } = {}) {
     });
     ffmpeg.on("close", (code, signal) => resolve({ code, signal }));
   });
+
+  const writeError = (async () => {
+    for (let i = 0; i < minFrames; i++) {
+      let buf;
+      if (chunks) {
+        const ci = i % totalChunks;
+        buf = embedChunk(bmpBuf, chunks[ci], ci, totalChunks);
+        if (i < totalChunks && (i + 1) % 100 === 0) {
+          console.log(`Stego embed: ${i + 1}/${totalChunks} chunks encoded...`);
+        }
+      } else {
+        buf = bmpBuf;
+      }
+      const ok = ffmpeg.stdin.write(buf);
+      if (!ok) {
+        await new Promise((r) => ffmpeg.stdin.once("drain", r));
+      }
+    }
+    ffmpeg.stdin.end();
+  })().catch((err) => err);
 
   try {
     const reader = new FlvStreamReader(ffmpeg.stdout);
@@ -185,7 +194,8 @@ async function* generateTags(filePath, { fps = 1, messagePath } = {}) {
     }
 
     console.log(
-      `FLV (ffmpeg): v${header.version}, video=${header.hasVideo}, audio=${header.hasAudio}`
+      `FLV (ffmpeg): v${header.version}, video=${header.hasVideo}, audio=${header.hasAudio}, ` +
+      `chunks=${totalChunks}, total_frames=${minFrames}`
     );
 
     let tag;
@@ -201,11 +211,6 @@ async function* generateTags(filePath, { fps = 1, messagePath } = {}) {
     }
   } finally {
     ffmpeg.kill();
-    if (tmpFile) {
-      try {
-        fs.unlinkSync(tmpFile);
-      } catch (_) {}
-    }
   }
 }
 
