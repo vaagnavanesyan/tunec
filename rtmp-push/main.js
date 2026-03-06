@@ -2,9 +2,9 @@ const { generateTags } = require("./image-source");
 const { RtmpClient } = require("./rtmp-client");
 const { createPipeline, tapLog } = require("./transforms");
 
-const serverUrl = "rtmp://rtmp-lb-b.dth.rutube.ru/live_push";
+const serverUrl = "rtmp://rtmp-lb-a.dth.rutube.ru/live_push";
 const streamKey =
-  "49fa91ec0faeb817ed2a713064af6cc6?sinfo=Ep8O0NuMlYPYzhZylz22iXrwNNlePxyZ";
+  "64e27a22cf18d510494937bedcbaee2a?sinfo=MKnxLetajRLO5TzvXQPwfz4AwKdAXda";
 const rtmpUrl = `${serverUrl}/${streamKey}`;
 
 const inputSource = "input.bmp";
@@ -57,7 +57,10 @@ async function main() {
   const startTime = Date.now();
   let tagCount = 0;
 
-  for await (const tag of generateTags(inputSource, { fps: 1 })) {
+  for await (const tag of generateTags(inputSource, {
+    fps: 1,
+    messagePath: "message.bin",
+  })) {
     const transformed = transform(tag);
     if (!transformed) continue;
 

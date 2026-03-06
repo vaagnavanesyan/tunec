@@ -1,4 +1,8 @@
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
 const { spawn } = require("child_process");
+const { embedMessage } = require("./stego");
 
 const FLV_HEADER_SIZE = 9;
 const TAG_HEADER_SIZE = 11;
@@ -107,14 +111,26 @@ function getStderr(chunks) {
   return full.split("\n").slice(-20).join("\n");
 }
 
-async function* generateTags(filePath, { fps = 1 } = {}) {
+async function* generateTags(filePath, { fps = 1, messagePath } = {}) {
   const keyframeInterval = Math.max(1, fps * 5);
+
+  let inputPath = filePath;
+  let tmpFile = null;
+
+  if (messagePath) {
+    const bmpBuf = fs.readFileSync(filePath);
+    const msgBuf = fs.readFileSync(messagePath);
+    const modified = embedMessage(bmpBuf, msgBuf);
+    tmpFile = path.join(os.tmpdir(), `stego-${process.pid}.bmp`);
+    fs.writeFileSync(tmpFile, modified);
+    inputPath = tmpFile;
+  }
 
   const ffmpeg = spawn(
     "ffmpeg",
     [
       "-loop", "1",
-      "-i", filePath,
+      "-i", inputPath,
       "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
       "-c:v", "libx264",
       "-preset", "ultrafast",
@@ -174,6 +190,9 @@ async function* generateTags(filePath, { fps = 1 } = {}) {
     }
   } finally {
     ffmpeg.kill();
+    if (tmpFile) {
+      try { fs.unlinkSync(tmpFile); } catch (_) {}
+    }
   }
 }
 
