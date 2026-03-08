@@ -1,10 +1,26 @@
 const fs = require("fs");
+const path = require("path");
 const { spawn } = require("child_process");
-const { prepareChunks, embedChunk } = require("./stego");
+
+let stegoJs = null;
+try { stegoJs = require("./stego"); } catch (_) {}
 
 const FLV_HEADER_SIZE = 9;
 const TAG_HEADER_SIZE = 11;
 const PREV_TAG_SIZE_FIELD = 4;
+
+const FFMPEG_STEGO_PATH = path.resolve(
+  __dirname, "ffmpeg-stego", "ffmpeg-build", "bin", "ffmpeg"
+);
+
+function resolveFFmpeg() {
+  if (fs.existsSync(FFMPEG_STEGO_PATH)) return FFMPEG_STEGO_PATH;
+  return process.env.FFMPEG_BIN || "ffmpeg";
+}
+
+function hasNativeStego() {
+  return fs.existsSync(FFMPEG_STEGO_PATH);
+}
 
 // --- Streaming FLV parser (reads from a readable stream) ---
 
@@ -108,32 +124,71 @@ function getStderr(chunks) {
   return full.split("\n").slice(-20).join("\n");
 }
 
-async function* generateTags(filePath, { fps = 1, messagePath, holdSeconds = 30 } = {}) {
+/**
+ * Generate FLV tags with steganographic payload.
+ *
+ * When the modified FFmpeg with native stego filters is available, the
+ * embedding happens inside FFmpeg via the stegoembed video filter—frames
+ * are piped unmodified and the filter encodes the message into YUV pixels
+ * using multi-level QIM across all three planes.
+ *
+ * Falls back to JS-based stego.js (green-channel QIM only) otherwise.
+ */
+async function* generateTags(filePath, {
+  fps = 1,
+  messagePath,
+  holdSeconds = 30,
+  qstep = 0,
+  bpp = 8,
+  reps = 1,
+  rsNsym = 0,
+} = {}) {
   const keyframeInterval = 1;
   const bmpBuf = fs.readFileSync(filePath);
+  const ffmpegBin = resolveFFmpeg();
+  const native = hasNativeStego() && messagePath;
 
-  let chunks = null;
   let totalChunks = 1;
-  if (messagePath) {
+  let chunks = null;
+  let minFrames;
+
+  if (native) {
+    /* Native mode: FFmpeg stegoembed filter handles chunking internally.
+     * We pipe the unmodified carrier BMP for enough frames. */
+    minFrames = Math.max(30, holdSeconds * fps);
+    console.log(`Using native stegoembed filter (${ffmpegBin})`);
+  } else if (messagePath && stegoJs) {
     const msgBuf = fs.readFileSync(messagePath);
-    const prepared = prepareChunks(bmpBuf, msgBuf);
+    const prepared = stegoJs.prepareChunks(bmpBuf, msgBuf);
     chunks = prepared.chunks;
     totalChunks = prepared.totalChunks;
+    minFrames = totalChunks + holdSeconds * fps;
+    console.log(`Using JS stego fallback (${totalChunks} chunks)`);
+  } else {
+    minFrames = holdSeconds * fps;
   }
 
-  const minFrames = totalChunks + holdSeconds * fps;
+  const vfFilter = native
+    ? ["-vf", `stegoembed=msg=${path.resolve(messagePath)}:hold=${Math.max(1, Math.ceil(holdSeconds))}:qstep=${qstep}:bpp=${bpp}:reps=${reps}:rs=${rsNsym}`]
+    : [];
+
+  const crf = native ? "0" : "17";
+  const extraParams = native
+    ? ["-x264-params", "deblock=0,0"]
+    : ["-tune", "stillimage"];
 
   const ffmpeg = spawn(
-    "ffmpeg",
+    ffmpegBin,
     [
       "-f", "image2pipe",
       "-framerate", String(fps),
       "-c:v", "bmp",
       "-i", "pipe:0",
+      ...vfFilter,
       "-c:v", "libx264",
       "-preset", "ultrafast",
-      "-tune", "stillimage",
-      "-crf", "17",
+      ...extraParams,
+      "-crf", crf,
       "-pix_fmt", "yuv420p",
       "-r", String(fps),
       "-g", String(keyframeInterval),
@@ -151,7 +206,7 @@ async function* generateTags(filePath, { fps = 1, messagePath, holdSeconds = 30 
     ffmpeg.on("error", (err) => {
       if (err.code === "ENOENT") {
         reject(
-          new Error("ffmpeg not found. Install ffmpeg to use H.264 encoding.")
+          new Error(`ffmpeg not found at ${ffmpegBin}. Build with ./ffmpeg-stego/build-ffmpeg.sh`)
         );
       } else {
         reject(err);
@@ -163,9 +218,9 @@ async function* generateTags(filePath, { fps = 1, messagePath, holdSeconds = 30 
   const writeError = (async () => {
     for (let i = 0; i < minFrames; i++) {
       let buf;
-      if (chunks) {
+      if (!native && chunks) {
         const ci = i % totalChunks;
-        buf = embedChunk(bmpBuf, chunks[ci], ci, totalChunks);
+        buf = stegoJs.embedChunk(bmpBuf, chunks[ci], ci, totalChunks);
         if (i < totalChunks && (i + 1) % 100 === 0) {
           console.log(`Stego embed: ${i + 1}/${totalChunks} chunks encoded...`);
         }
@@ -193,9 +248,10 @@ async function* generateTags(filePath, { fps = 1, messagePath, holdSeconds = 30 
       );
     }
 
+    const mode = native ? "native-stego" : (chunks ? "js-stego" : "plain");
     console.log(
       `FLV (ffmpeg): v${header.version}, video=${header.hasVideo}, audio=${header.hasAudio}, ` +
-      `chunks=${totalChunks}, total_frames=${minFrames}`
+      `mode=${mode}, total_frames=${minFrames}`
     );
 
     let tag;
@@ -214,4 +270,4 @@ async function* generateTags(filePath, { fps = 1, messagePath, holdSeconds = 30 
   }
 }
 
-module.exports = { generateTags };
+module.exports = { generateTags, resolveFFmpeg, hasNativeStego };

@@ -69,7 +69,13 @@ async function main() {
   console.log(`\nDone. Sent ${tagCount} tags in ${elapsedSec.toFixed(1)}s`);
   console.log(`  hidden payload : ${msgSize} bytes`);
   console.log(`  video sent     : ${(videoBytes / 1024).toFixed(1)} KB`);
-  console.log(`  throughput     : ${(msgSize / elapsedSec).toFixed(0)} bytes/s (payload), ${(videoBytes / 1024 / elapsedSec).toFixed(1)} KB/s (video)`);
+  console.log(
+    `  throughput     : ${(msgSize / elapsedSec / 1024 / 1024).toFixed(
+      1
+    )} MB/s (payload), ${(videoBytes / 1024 / elapsedSec / 1024).toFixed(
+      1
+    )} MB/s (video)`
+  );
   await sleep(1000);
   client.close();
 }

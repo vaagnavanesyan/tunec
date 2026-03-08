@@ -1,9 +1,68 @@
 const fs = require("fs");
+const path = require("path");
+const os = require("os");
 const { spawn } = require("child_process");
-const { extractChunk, reassembleChunks } = require("./stego");
+const { resolveFFmpeg, hasNativeStego } = require("./image-source");
+
+let stegoJs = null;
+try { stegoJs = require("./stego"); } catch (_) {}
 
 const DEFAULT_URL =
   "https://bl.rutube.ru/livestream/64e27a22cf18d510494937bedcbaee2a/index.m3u8?s=J_tvCKzuzMfQi9z5fDuI3Q&e=1772536256&scheme=https";
+
+// --- Native stegoextract mode ---
+
+async function decodeNative(source, { maxFrames = 256, timeoutMs = 120_000, qstep = 0, bpp = 8, reps = 1, rsNsym = 0 } = {}) {
+  const ffmpegBin = resolveFFmpeg();
+  const tmpFile = path.join(os.tmpdir(), `stego_extract_${process.pid}_${Date.now()}.bin`);
+
+  const vfArgs = `stegoextract=out=${tmpFile}:qstep=${qstep}:bpp=${bpp}:reps=${reps}:rs=${rsNsym}`;
+
+  const isFile = fs.existsSync(source) && !source.startsWith("http");
+  const inputArgs = isFile && source.endsWith(".bmp")
+    ? ["-f", "image2", "-i", source]
+    : ["-rw_timeout", "15000000", "-i", source, "-frames:v", String(maxFrames)];
+
+  console.log(`Native extraction from: ${source}`);
+
+  const args = [
+    "-loglevel", "info",
+    ...inputArgs,
+    "-vf", vfArgs,
+    "-f", "null", "-",
+  ];
+
+  const ffmpeg = spawn(ffmpegBin, args, { stdio: ["ignore", "pipe", "pipe"] });
+
+  const killTimer = setTimeout(() => ffmpeg.kill("SIGKILL"), timeoutMs);
+
+  ffmpeg.stderr.on("data", (chunk) => {
+    const lines = chunk.toString().trim().split("\n");
+    for (const line of lines) {
+      if (line.includes("stego") || line.includes("chunk") || line.includes("Wrote"))
+        process.stderr.write(`  [ffmpeg] ${line}\n`);
+    }
+  });
+
+  const code = await new Promise((resolve) => {
+    ffmpeg.on("close", (c) => { clearTimeout(killTimer); resolve(c); });
+    ffmpeg.on("error", () => { clearTimeout(killTimer); resolve(1); });
+  });
+
+  if (code !== 0) {
+    throw new Error(`ffmpeg exited with code ${code}`);
+  }
+
+  if (!fs.existsSync(tmpFile)) {
+    throw new Error("stegoextract produced no output file");
+  }
+
+  const payload = fs.readFileSync(tmpFile);
+  fs.unlinkSync(tmpFile);
+  return payload;
+}
+
+// --- JS fallback mode (BMP frame extraction) ---
 
 async function* grabFrames(source, { maxFrames = 256, timeoutMs = 120_000 } = {}) {
   const isFile = fs.existsSync(source) && !source.startsWith("http");
@@ -32,9 +91,7 @@ async function* grabFrames(source, { maxFrames = 256, timeoutMs = 120_000 } = {}
     ffmpeg.kill("SIGKILL");
   }, timeoutMs);
 
-  const stderrChunks = [];
   ffmpeg.stderr.on("data", (chunk) => {
-    stderrChunks.push(chunk);
     const lines = chunk.toString().trim().split("\n");
     for (const line of lines) {
       if (
@@ -115,8 +172,8 @@ async function* parseBmpStream(stream) {
   }
 }
 
-async function main() {
-  const source = process.argv[2] || DEFAULT_URL;
+async function decodeFallback(source) {
+  if (!stegoJs) throw new Error("stego.js not available and native ffmpeg not found");
 
   const chunks = new Map();
   let totalChunks = null;
@@ -127,7 +184,7 @@ async function main() {
     console.log(`Frame: ${width}x${height}, ${bmpBuffer.length} bytes`);
 
     try {
-      const { chunkIndex, totalChunks: tc, data } = extractChunk(bmpBuffer);
+      const { chunkIndex, totalChunks: tc, data } = stegoJs.extractChunk(bmpBuffer);
       totalChunks = tc;
       if (!chunks.has(chunkIndex)) {
         chunks.set(chunkIndex, data);
@@ -148,8 +205,12 @@ async function main() {
     throw new Error(`Incomplete: received ${got}/${expected} chunks`);
   }
 
-  const payload = reassembleChunks(chunks);
+  return stegoJs.reassembleChunks(chunks);
+}
 
+// --- Main ---
+
+function printPayload(payload) {
   console.log(`\nDecoded message (${payload.length} bytes):`);
 
   const text = payload.toString("utf8");
@@ -172,6 +233,19 @@ async function main() {
       );
     }
   }
+}
+
+async function main() {
+  const source = process.argv[2] || DEFAULT_URL;
+  const native = hasNativeStego();
+
+  console.log(`Mode: ${native ? "native stegoextract" : "JS fallback"}`);
+
+  const payload = native
+    ? await decodeNative(source)
+    : await decodeFallback(source);
+
+  printPayload(payload);
 }
 
 main().catch((err) => {

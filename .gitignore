@@ -43,3 +43,6 @@ proguard/
 *.log
 rtmp-push/input.flv
 rtmp-push/node_modules
+rtmp-push/ffmpeg-stego/ffmpeg-src
+rtmp-push/html/record
+rtmp-push/ffmpeg-stego/ffmpeg-build

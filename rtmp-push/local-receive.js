@@ -1,25 +1,153 @@
 const fs = require("fs");
+const path = require("path");
+const os = require("os");
 const { spawn } = require("child_process");
-const { extractChunk, reassembleChunks } = require("./stego");
+const { resolveFFmpeg, hasNativeStego } = require("./image-source");
+
+let stegoJs = null;
+try {
+  stegoJs = require("./stego");
+} catch (_) {}
 
 const DEFAULT_URL = "rtmp://localhost:1935/live/test";
 
 const rtmpUrl = process.argv[2] || process.env.RTMP_URL || DEFAULT_URL;
 const expectedMessagePath = process.argv[3] || "message.bin";
 
+// --- Native stegoextract mode ---
+
+async function receiveNative(
+  source,
+  { timeoutMs = 600_000, qstep = 0, bpp = 8, reps = 1, rsNsym = 0 } = {}
+) {
+  const ffmpegBin = resolveFFmpeg();
+  const tmpFile = path.join(
+    os.tmpdir(),
+    `stego_recv_${process.pid}_${Date.now()}.bin`
+  );
+
+  const vfArgs = `stegoextract=out=${tmpFile}:qstep=${qstep}:bpp=${bpp}:reps=${reps}:rs=${rsNsym}`;
+
+  console.log(`Native extraction from: ${source}`);
+
+  const args = [
+    "-loglevel",
+    "info",
+    "-rw_timeout",
+    "15000000",
+    "-analyzeduration",
+    "0",
+    "-probesize",
+    "32",
+    "-fflags",
+    "nobuffer",
+    "-flags",
+    "low_delay",
+    "-i",
+    source,
+    "-vf",
+    vfArgs,
+    "-f",
+    "null",
+    "-",
+  ];
+
+  const ffmpeg = spawn(ffmpegBin, args, { stdio: ["ignore", "pipe", "pipe"] });
+
+  let killed = false;
+  const kill = () => {
+    if (!killed) {
+      killed = true;
+      ffmpeg.kill();
+    }
+  };
+  const killTimer = setTimeout(kill, timeoutMs);
+
+  const startTime = Date.now();
+  let framesProcessed = 0;
+
+  ffmpeg.stderr.on("data", (chunk) => {
+    const lines = chunk.toString().trim().split("\n");
+    for (const line of lines) {
+      if (line.includes("frame=")) {
+        const m = line.match(/frame=\s*(\d+)/);
+        if (m) framesProcessed = parseInt(m[1], 10);
+      }
+      if (
+        line.includes("stego") ||
+        line.includes("chunk") ||
+        line.includes("Wrote") ||
+        line.includes("All")
+      )
+        process.stderr.write(`  [ffmpeg] ${line}\n`);
+      if (line.includes("All") && line.includes("chunks received")) {
+        setTimeout(kill, 500);
+      }
+    }
+  });
+
+  const code = await new Promise((resolve) => {
+    ffmpeg.on("close", (c) => {
+      clearTimeout(killTimer);
+      resolve(c);
+    });
+    ffmpeg.on("error", () => {
+      clearTimeout(killTimer);
+      resolve(1);
+    });
+  });
+
+  const elapsedMs = Date.now() - startTime;
+  const elapsedSec = elapsedMs / 1000;
+
+  if (!fs.existsSync(tmpFile)) {
+    console.error(
+      `\nFailed: no output (${elapsedSec.toFixed(
+        1
+      )}s, ~${framesProcessed} frames, exit=${code})`
+    );
+    process.exit(1);
+  }
+
+  const payload = fs.readFileSync(tmpFile);
+  fs.unlinkSync(tmpFile);
+
+  console.log(`\nExtracted stego payload: ${payload.length} bytes`);
+  console.log(`  frames processed : ~${framesProcessed}`);
+  console.log(`  time             : ${elapsedSec.toFixed(1)}s`);
+  console.log(
+    `  throughput       : ${(payload.length / elapsedSec / 1024 / 1024).toFixed(
+      1
+    )} MB/s`
+  );
+
+  return payload;
+}
+
+// --- JS fallback mode ---
+
 function grabFrames(source, { timeoutMs = 600_000 } = {}) {
   console.log(`Grabbing frames from: ${source}`);
 
   const args = [
-    "-loglevel", "warning",
-    "-rw_timeout", "15000000",
-    "-analyzeduration", "0",
-    "-probesize", "32",
-    "-fflags", "nobuffer",
-    "-flags", "low_delay",
-    "-i", source,
-    "-f", "image2pipe",
-    "-c:v", "bmp",
+    "-loglevel",
+    "warning",
+    "-rw_timeout",
+    "15000000",
+    "-analyzeduration",
+    "0",
+    "-probesize",
+    "32",
+    "-fflags",
+    "nobuffer",
+    "-flags",
+    "low_delay",
+    "-i",
+    source,
+    "-f",
+    "image2pipe",
+    "-c:v",
+    "bmp",
     "pipe:1",
   ];
 
@@ -33,16 +161,8 @@ function grabFrames(source, { timeoutMs = 600_000 } = {}) {
     }
   };
 
-  const killTimer = setTimeout(() => {
-    kill();
-  }, timeoutMs);
-
-  const stderrChunks = [];
-  ffmpeg.stderr.on("data", (chunk) => stderrChunks.push(chunk));
-
-  const exitPromise = new Promise((resolve) => {
-    ffmpeg.on("close", (code) => resolve(code));
-  });
+  const killTimer = setTimeout(kill, timeoutMs);
+  ffmpeg.stderr.on("data", () => {});
 
   ffmpeg.on("error", (err) => {
     clearTimeout(killTimer);
@@ -58,7 +178,7 @@ function grabFrames(source, { timeoutMs = 600_000 } = {}) {
       clearTimeout(killTimer);
       kill();
     },
-    exitPromise,
+    exitPromise: new Promise((r) => ffmpeg.on("close", r)),
   };
 }
 
@@ -88,7 +208,9 @@ async function* parseBmpStream(stream) {
   async function ensureBytes(n) {
     while (buf.length < n) {
       if (done) return false;
-      await new Promise((resolve) => { waitResolve = resolve; });
+      await new Promise((resolve) => {
+        waitResolve = resolve;
+      });
     }
     return true;
   }
@@ -106,11 +228,11 @@ async function* parseBmpStream(stream) {
   }
 }
 
-async function main() {
-  console.log(`Receiving from: ${rtmpUrl}`);
-  console.log(`Expected message: ${expectedMessagePath}`);
+async function receiveFallback(source) {
+  if (!stegoJs)
+    throw new Error("stego.js not available and native ffmpeg not found");
 
-  const { frames, cleanup } = grabFrames(rtmpUrl);
+  const { frames, cleanup } = grabFrames(source);
 
   const chunks = new Map();
   let totalChunks = null;
@@ -122,10 +244,16 @@ async function main() {
       framesProcessed++;
       const width = bmpBuffer.readInt32LE(18);
       const height = Math.abs(bmpBuffer.readInt32LE(22));
-      console.log(`Frame captured: ${width}x${height}, ${bmpBuffer.length} bytes`);
+      console.log(
+        `Frame captured: ${width}x${height}, ${bmpBuffer.length} bytes`
+      );
 
       try {
-        const { chunkIndex, totalChunks: tc, data } = extractChunk(bmpBuffer);
+        const {
+          chunkIndex,
+          totalChunks: tc,
+          data,
+        } = stegoJs.extractChunk(bmpBuffer);
         totalChunks = tc;
         if (!chunks.has(chunkIndex)) {
           chunks.set(chunkIndex, data);
@@ -152,15 +280,40 @@ async function main() {
   if (totalChunks === null || chunks.size !== totalChunks) {
     const got = chunks.size;
     const expected = totalChunks ?? "?";
-    console.error(`\nFailed: received ${got}/${expected} chunks (${elapsedSec.toFixed(1)}s, ${framesProcessed} frames)`);
+    console.error(
+      `\nFailed: received ${got}/${expected} chunks (${elapsedSec.toFixed(
+        1
+      )}s, ${framesProcessed} frames)`
+    );
     process.exit(1);
   }
 
-  const payload = reassembleChunks(chunks);
+  const payload = stegoJs.reassembleChunks(chunks);
   console.log(`\nExtracted stego payload: ${payload.length} bytes`);
-  console.log(`  frames processed : ${framesProcessed} (${chunks.size} unique chunks)`);
+  console.log(
+    `  frames processed : ${framesProcessed} (${chunks.size} unique chunks)`
+  );
   console.log(`  time             : ${elapsedSec.toFixed(1)}s`);
-  console.log(`  throughput       : ${(payload.length / elapsedSec).toFixed(0)} bytes/s`);
+  console.log(
+    `  throughput       : ${(payload.length / elapsedSec / 1024 / 1024).toFixed(
+      1
+    )} MB/s`
+  );
+
+  return payload;
+}
+
+// --- Main ---
+
+async function main() {
+  const native = hasNativeStego();
+  console.log(`Receiving from: ${rtmpUrl}`);
+  console.log(`Expected message: ${expectedMessagePath}`);
+  console.log(`Mode: ${native ? "native stegoextract" : "JS fallback"}`);
+
+  const payload = native
+    ? await receiveNative(rtmpUrl)
+    : await receiveFallback(rtmpUrl);
 
   if (fs.existsSync(expectedMessagePath)) {
     const expected = fs.readFileSync(expectedMessagePath);

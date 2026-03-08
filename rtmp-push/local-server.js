@@ -8,6 +8,9 @@ const config = {
     ping: 30,
     ping_timeout: 60,
   },
+  record: {
+    path: "./html/record",
+  },
   http: {
     port: 8000,
     allow_origin: "*",

@@ -1,5 +1,6 @@
 const { spawn } = require("child_process");
 const path = require("path");
+const { hasNativeStego } = require("./image-source");
 
 const RTMP_URL = "rtmp://localhost:1935/live/test";
 const SETTLE_MS = 2000;
@@ -37,6 +38,8 @@ function run(script, args = []) {
 }
 
 async function main() {
+  const native = hasNativeStego();
+  console.log(`=== Stego mode: ${native ? "NATIVE (FFmpeg stegoembed/stegoextract)" : "JS FALLBACK (stego.js)"} ===`);
   console.log("=== Starting local RTMP server ===");
   const server = spawn(process.execPath, ["local-server.js"], {
     cwd: __dirname,
